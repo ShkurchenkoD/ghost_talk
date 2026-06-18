@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ghosttalk
+      POSTGRES_USER: ghosttalk
+      POSTGRES_PASSWORD: ghosttalk
+    ports:
+      - "${HOST_DB_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ghosttalk -d ghosttalk"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://ghosttalk:ghosttalk@db:5432/ghosttalk?sslmode=disable
+      ADDR: :8080
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${HOST_BACKEND_PORT:-18080}:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: http://localhost:${HOST_BACKEND_PORT:-18080}
+    depends_on:
+      - backend
+    ports:
+      - "${HOST_FRONTEND_PORT:-13000}:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
