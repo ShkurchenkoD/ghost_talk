@@ -1,0 +1,17 @@
+services:
+  livekit:
+    image: livekit/livekit-server:master
+    container_name: livekit
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      LIVEKIT_CONFIG: |
+        port: ${LIVEKIT_PORT}
+        log_level: ${LIVEKIT_LOG_LEVEL}
+        rtc:
+          tcp_port: ${LIVEKIT_TCP_PORT}
+          port_range_start: ${LIVEKIT_RTC_PORT_START}
+          port_range_end: ${LIVEKIT_RTC_PORT_END}
+          use_external_ip: ${LIVEKIT_USE_EXTERNAL_IP}
+        keys:
+          ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}

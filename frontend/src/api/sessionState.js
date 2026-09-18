@@ -5,10 +5,6 @@ export const METHODOLOGIES = [
   { value: "anonymous_qa" },
 ];
 
-export function participantKey(code) {
-  return `ghosttalk_participant_${String(code).toUpperCase()}`;
-}
-
-export function facilitatorKey(code) {
-  return `ghosttalk_facilitator_${String(code).toUpperCase()}`;
+export function videoDisplayNameKey(code, role) {
+  return `ghosttalk_video_name_${role}_${String(code).toUpperCase()}`;
 }

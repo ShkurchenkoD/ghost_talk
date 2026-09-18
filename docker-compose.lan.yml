@@ -1,0 +1,64 @@
+services:
+  db:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=20
+    environment:
+      POSTGRES_DB: ghosttalk
+      POSTGRES_USER: ghosttalk
+      POSTGRES_PASSWORD: ghosttalk
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ghosttalk -d ghosttalk"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://ghosttalk:ghosttalk@db:5432/ghosttalk?sslmode=disable
+      ADDR: :8080
+      WHISPER_URL: http://whisper:8000
+      LIVEKIT_URL: "${LIVEKIT_URL:-}"
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
+      LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
+    depends_on:
+      db:
+        condition: service_healthy
+      whisper:
+        condition: service_started
+    restart: unless-stopped
+
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    environment:
+      WHISPER_MODEL: Systran/faster-whisper-small
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE: ""
+    depends_on:
+      - backend
+    environment:
+      ENABLE_TLS: "${ENABLE_TLS:-true}"
+      SERVER_NAME: "${SERVER_NAME:-ghosttalk.home.arpa}"
+    ports:
+      - "${HOST_FRONTEND_HTTPS_PORT:-443}:443"
+    volumes:
+      - "${TLS_CERTS_DIR:-./certs}:/etc/nginx/tls:ro"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

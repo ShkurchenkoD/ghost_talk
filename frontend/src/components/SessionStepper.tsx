@@ -1,12 +1,14 @@
 import { cn } from "../lib/utils";
-
-const stages = ["Інструкція", "Збір ідей", "Групування", "Голосування", "Підсумок"];
+import { useI18n } from "../i18n.jsx";
 
 type SessionStepperProps = {
   currentIndex: number;
 };
 
 export default function SessionStepper({ currentIndex }: SessionStepperProps) {
+  const { t } = useI18n();
+  const stages: string[] = t.sessionStepperStages;
+
   return (
     <div className="rounded-3xl border border-border bg-card p-5 shadow-soft">
       <ol className="grid gap-3 md:grid-cols-5 md:gap-4">
@@ -24,7 +26,7 @@ export default function SessionStepper({ currentIndex }: SessionStepperProps) {
                   !isCurrent && !isDone && "border-border bg-white text-text-secondary",
                 )}
               >
-                <p className="text-xs font-semibold">Крок {index + 1}</p>
+                <p className="text-xs font-semibold">{t.sessionStepperStepLabel} {index + 1}</p>
                 <p className="mt-1 font-semibold">{label}</p>
               </div>
             </li>

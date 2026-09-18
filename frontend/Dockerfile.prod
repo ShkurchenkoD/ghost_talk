@@ -1,0 +1,17 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+ARG VITE_API_BASE=""
+ENV VITE_API_BASE=$VITE_API_BASE
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY nginx.http.conf.template /etc/nginx/templates/http.conf.template
+COPY nginx.https.conf.template /etc/nginx/templates/https.conf.template
+COPY docker-entrypoint.prod.sh /docker-entrypoint.prod.sh
+COPY --from=builder /app/dist /usr/share/nginx/html
+RUN chmod +x /docker-entrypoint.prod.sh
+EXPOSE 80 443
+CMD ["/docker-entrypoint.prod.sh"]

@@ -36,7 +36,7 @@ export default function SummaryPage() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await getSummary(sessionCode);
+        const res = await getSummary(sessionCode, "");
         setData(res);
       } catch (err) {
         setError(err.message);

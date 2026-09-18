@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ghosttalk
       POSTGRES_PASSWORD: ghosttalk
     ports:
-      - "${HOST_DB_PORT:-55432}:5432"
+      - "127.0.0.1:${HOST_DB_PORT:-55432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
@@ -22,18 +22,61 @@ services:
     environment:
       DATABASE_URL: postgres://ghosttalk:ghosttalk@db:5432/ghosttalk?sslmode=disable
       ADDR: :8080
+      WHISPER_URL: http://whisper:8000
+      TTS_URL: http://tts:8000
+      ANONYMOUS_AUDIO_WORKER_URL: http://anonymous-audio-worker:8080
+      LIVEKIT_URL: "${LIVEKIT_URL:-}"
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
+      LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
     depends_on:
       db:
         condition: service_healthy
+      whisper:
+        condition: service_started
+      tts:
+        condition: service_started
+      anonymous-audio-worker:
+        condition: service_started
     ports:
-      - "${HOST_BACKEND_PORT:-18080}:8080"
+      - "127.0.0.1:${HOST_BACKEND_PORT:-18080}:8080"
+    restart: unless-stopped
+
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    environment:
+      WHISPER_MODEL: Systran/faster-whisper-small
+    restart: unless-stopped
+
+  tts:
+    build: ./tts
+    restart: unless-stopped
+
+  anonymous-audio-worker:
+    build: ./anonymous-audio-worker
+    environment:
+      LIVEKIT_URL: "${LIVEKIT_URL:-}"
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
+      LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+      DATABASE_URL: postgres://ghosttalk:ghosttalk@db:5432/ghosttalk?sslmode=disable
+      STT_PROVIDER: faster-whisper
+      STT_MODEL: small
+      TTS_PROVIDER: piper
+      LOG_LEVEL: info
+      LOG_TRANSCRIPTS: "false"
+      SAVE_AUDIO_SAMPLES: "false"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       args:
-        VITE_API_BASE: http://localhost:${HOST_BACKEND_PORT:-18080}
+        VITE_API_BASE: ""
     depends_on:
       - backend
     ports:

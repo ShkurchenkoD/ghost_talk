@@ -1,0 +1,23 @@
+[Unit]
+Description=Smallstep Certificate Authority
+Documentation=https://smallstep.com/docs/step-ca/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+Environment=STEPPATH=/home/ghost/.step
+ExecStart=/usr/bin/step-ca /home/ghost/.step/config/ca.json
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

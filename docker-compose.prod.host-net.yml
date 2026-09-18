@@ -1,0 +1,29 @@
+services:
+  db:
+    network_mode: host
+
+  backend:
+    build:
+      network: host
+    network_mode: host
+    environment:
+      DATABASE_URL: postgres://ghosttalk:ghosttalk@localhost:5432/ghosttalk?sslmode=disable
+      WHISPER_URL: http://localhost:8000
+      TTS_URL: http://localhost:8001
+
+  whisper:
+    network_mode: host
+
+  tts:
+    build:
+      network: host
+    network_mode: host
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001"]
+
+  frontend:
+    build:
+      network: host
+    network_mode: host
+    environment:
+      BACKEND_HOST: localhost
+    ports: !reset []

@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import CardBoard from "../components/CardBoard";
-import { getEventsUrl, getSession, listCards, patchCard, patchSession, saveSummary } from "../api/client";
-import { facilitatorKey } from "../api/sessionState";
+import { clearSessionAccess, getEventsUrl, getSession, listCards, patchCard, patchSession, saveSummary } from "../api/client";
 import { useI18n } from "../i18n.jsx";
 
 export default function FacilitatorPage() {
@@ -12,7 +11,6 @@ export default function FacilitatorPage() {
   const [session, setSession] = useState(null);
   const [categories, setCategories] = useState([]);
   const [cards, setCards] = useState([]);
-  const [token, setToken] = useState("");
   const [summary, setSummary] = useState({
     markdown: "",
     grouped_thoughts: "",
@@ -20,22 +18,9 @@ export default function FacilitatorPage() {
     action_items: "",
   });
   const [error, setError] = useState("");
+  const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
-    const facilitatorToken = localStorage.getItem(facilitatorKey(sessionCode)) || "";
-    if (!facilitatorToken) {
-      const typed = window.prompt(t.facilitatorTokenRequired);
-      if (typed) {
-        localStorage.setItem(facilitatorKey(sessionCode), typed.trim());
-        setToken(typed.trim());
-      }
-    } else {
-      setToken(facilitatorToken);
-    }
-  }, [sessionCode, t.facilitatorTokenRequired]);
-
-  useEffect(() => {
-    if (!token) return;
     let alive = true;
     (async () => {
       try {
@@ -43,7 +28,7 @@ export default function FacilitatorPage() {
         if (!alive) return;
         setSession(sessionRes.session);
         setCategories(sessionRes.categories);
-        const cardsRes = await listCards(sessionCode, true, token);
+        const cardsRes = await listCards(sessionCode, true);
         if (!alive) return;
         setCards(cardsRes.cards);
       } catch (err) {
@@ -54,7 +39,7 @@ export default function FacilitatorPage() {
     return () => {
       alive = false;
     };
-  }, [sessionCode, token]);
+  }, [sessionCode]);
 
   useEffect(() => {
     if (!sessionCode) return;
@@ -74,7 +59,7 @@ export default function FacilitatorPage() {
 
   async function updateCard(id, payload) {
     try {
-      await patchCard(id, payload, token);
+      await patchCard(id, payload, "");
     } catch (err) {
       setError(err.message);
     }
@@ -82,7 +67,7 @@ export default function FacilitatorPage() {
 
   async function toggleVoting(open) {
     try {
-      await patchSession(sessionCode, { voting_open: open }, token);
+      await patchSession(sessionCode, { voting_open: open }, "");
     } catch (err) {
       setError(err.message);
     }
@@ -90,7 +75,17 @@ export default function FacilitatorPage() {
 
   async function endSession() {
     try {
-      await patchSession(sessionCode, { end_session: true }, token);
+      await patchSession(sessionCode, { end_session: true }, "");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function copyJoinLink(url) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 2000);
     } catch (err) {
       setError(err.message);
     }
@@ -99,13 +94,21 @@ export default function FacilitatorPage() {
   async function saveSummaryForm(e) {
     e.preventDefault();
     try {
-      await saveSummary(sessionCode, summary, token);
+      await saveSummary(sessionCode, summary, "");
     } catch (err) {
       setError(err.message);
     }
   }
 
-  if (!token) return <section className="panel">{t.missingFacilitatorToken}</section>;
+  async function resetAccess() {
+    try {
+      await clearSessionAccess("facilitator", sessionCode);
+      window.location.assign("/");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   if (error && !session) return <section className="panel error">{error}</section>;
   if (!session) return <section className="panel">{t.loadingFacilitator}</section>;
 
@@ -115,6 +118,29 @@ export default function FacilitatorPage() {
         <h2>{t.facilitator}: {session.title}</h2>
         <p>{session.description}</p>
         <small>{t.joinCodeLabel}: {session.code}</small>
+        <label>
+          {t.joinLinkLabel}
+          <div className="join-inline">
+            <input type="text" readOnly value={`${window.location.origin}/session/${session.code}`} onFocus={(e) => e.target.select()} />
+            <button type="button" className="btn" onClick={() => copyJoinLink(`${window.location.origin}/session/${session.code}`)}>
+              {linkCopied ? t.linkCopied : t.copyLink}
+            </button>
+          </div>
+        </label>
+      </div>
+
+      <div className={`video-call-card${session.video_enabled ? "" : " is-disabled"}`}>
+        <div>
+          <strong>{session.video_enabled ? t.videoSession : t.videoUnavailableTitle}</strong>
+          <p>{session.video_enabled ? t.videoNoAccount : t.videoUnavailableHint}</p>
+        </div>
+        <div className="row">
+          {session.video_enabled ? (
+            <Link className="btn btn-primary" to={`/video/facilitator/${session.code}`}>{t.openVideo}</Link>
+          ) : (
+            <button type="button" className="btn btn-primary" disabled>{t.openVideo}</button>
+          )}
+        </div>
       </div>
 
       <div className="row">
@@ -123,6 +149,8 @@ export default function FacilitatorPage() {
         </button>
         <button className="btn" onClick={endSession} disabled={Boolean(session.ended_at)}>{t.endSession}</button>
         <Link className="btn" to={`/summary/${session.code}`}>{t.openSummary}</Link>
+        <Link className="btn" to={`/facilitator/${session.code}/audit`}>{t.openAudit}</Link>
+        <button className="btn" type="button" onClick={resetAccess}>{t.resetAccess}</button>
       </div>
 
       {error && <p className="error">{error}</p>}

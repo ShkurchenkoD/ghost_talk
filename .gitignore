@@ -4,4 +4,16 @@ frontend/dist
 
 # general
 .DS_Store
+.cache/
 *.log
+.env
+.env.*
+!.env.example
+!.env.prod.example
+!.env.lan.example
+
+# TLS and ACME artifacts
+certs/*
+!certs/.gitkeep
+certbot-www/*
+!certbot-www/.gitkeep
