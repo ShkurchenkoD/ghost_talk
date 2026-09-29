@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Session struct {
 	ID                        int64      `json:"id"`
@@ -133,4 +136,72 @@ type AnonymousAudioWorkItem struct {
 	LastErrorMessage    string  `json:"last_error_message"`
 	LanguageLocked      bool    `json:"language_locked"`
 	PIIRedactionEnabled bool    `json:"pii_redaction_enabled"`
+}
+
+// TranscriptSegment is a finalized portion of a session transcript.
+// ParticipantAlias is session-scoped and must never contain a real name.
+type TranscriptSegment struct {
+	ID               int64     `json:"id"`
+	SessionID        int64     `json:"session_id"`
+	ParticipantID    int64     `json:"participant_id,omitempty"`
+	ParticipantAlias string    `json:"participant_alias"`
+	SegmentKey       string    `json:"-"`
+	TrackSID         string    `json:"track_sid,omitempty"`
+	StartedAtMs      int64     `json:"started_at_ms"`
+	EndedAtMs        int64     `json:"ended_at_ms"`
+	Text             string    `json:"text"`
+	Language         string    `json:"language,omitempty"`
+	Confidence       float64   `json:"confidence"`
+	IsFinal          bool      `json:"is_final"`
+	Redacted         bool      `json:"redacted"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// TranscriptWorkItem is service-to-service data for the media worker. The
+// participant token never leaves the internal Docker network.
+type TranscriptWorkItem struct {
+	SessionCode        string `json:"session_code"`
+	Room               string `json:"room"`
+	InputRoom          string `json:"input_room"`
+	PublicRoom         string `json:"public_room"`
+	ParticipantID      int64  `json:"participant_id"`
+	ParticipantToken   string `json:"participant_token"`
+	PreferredLanguage  string `json:"preferred_language"`
+	AudioMode          string `json:"audio_mode"`
+	VoiceID            string `json:"voice_id"`
+	SessionStartedAtMs int64  `json:"session_started_at_ms"`
+}
+
+type SessionInsight struct {
+	SessionID        int64           `json:"session_id"`
+	ExecutiveSummary string          `json:"executive_summary"`
+	Themes           json.RawMessage `json:"themes"`
+	Decisions        json.RawMessage `json:"decisions"`
+	RisksQuestions   json.RawMessage `json:"risks_questions"`
+	GeneratedAt      *time.Time      `json:"generated_at,omitempty"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+type ActionItem struct {
+	ID               int64           `json:"id"`
+	SessionID        int64           `json:"session_id"`
+	Text             string          `json:"text"`
+	OwnerAlias       string          `json:"owner_alias,omitempty"`
+	DueDate          *time.Time      `json:"due_date,omitempty"`
+	SourceSegmentIDs json.RawMessage `json:"source_segment_ids"`
+	Status           string          `json:"status"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+type AnalysisJob struct {
+	ID              int64      `json:"id"`
+	SessionID       int64      `json:"session_id"`
+	Status          string     `json:"status"`
+	RequestedByRole string     `json:"requested_by_role"`
+	ErrorMessage    string     `json:"error_message,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
 }

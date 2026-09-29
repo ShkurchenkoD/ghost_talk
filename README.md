@@ -1,6 +1,9 @@
 # GhostTalk PoC
 
-Proof-of-Concept web app for structured anonymous facilitation sessions.
+GhostTalk — self-hosted вебплатформа для структурованих анонімних командних
+сесій. Вона допомагає збирати чесні думки, проводити голосування в реальному
+часі, безпечно спілкуватися у відеокімнаті та перетворювати розмову на
+перевірений протокол, висновки й action items.
 
 ## Stack
 
@@ -10,7 +13,7 @@ Proof-of-Concept web app for structured anonymous facilitation sessions.
 - Realtime: Server-Sent Events (`/api/sessions/:code/events`)
 - Voice input: mocked transcription prompt (no voice file storage)
 - Video rooms: embedded LiveKit rooms via `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET`
-- Anonymous audio mode: backend-controlled safe mode with `mute` fallback and a dedicated `anonymous-audio-worker` readiness service
+- Anonymous audio mode: backend-controlled safe mode with `mute` fallback, readiness worker, and consent-gated `media-worker` transcription
 
 ## Features Implemented
 
@@ -27,6 +30,50 @@ Proof-of-Concept web app for structured anonymous facilitation sessions.
   - end session
   - create/edit final summary
 - Summary page with top voted cards and Markdown export
+- LiveKit video rooms with browser avatar, blur/pixelation and anonymous voice
+  modes
+- Privacy-safe dual-room media topology with worker readiness and mute fallback
+- Consent-gated live captions and pseudonymous timestamped transcript segments
+- PII-redaction, transcript filters, facilitator editing with audit trail
+- Markdown/JSON transcript export, analysis jobs, insights and action items
+
+## Як працює захист медіа та протокол розмови
+
+### Dual-room архітектура LiveKit
+
+В анонімних режимах `masked` і `synthetic` учасник підключається до двох
+логічно ізольованих LiveKit-кімнат:
+
+```text
+Учасник ── raw-мікрофон ──► input room ──► media worker
+                                      │
+                                      └─ оброблений голос ──► public room
+```
+
+- `input room` доступна лише учаснику та media-worker і містить оригінальний
+  аудіотрек;
+- media-worker застосовує voice masking або конвеєр STT → PII-redaction → TTS;
+- у `public room` усі учасники отримують тільки оброблений аудіотрек;
+- LiveKit-токени забороняють анонімному учаснику публікувати raw-мікрофон у
+  public room;
+- raw-аудіо та raw-відео не записуються за замовчуванням.
+
+У режимі `normal`, коли анонімізацію явно вимкнено, мікрофон публікується
+напряму в public room — це очікувана поведінка звичайного відеодзвінка.
+
+### Live captions і текстовий протокол
+
+Після згоди учасника система перетворює мовлення на текст. Проміжні фрази
+передаються як live captions через SSE і можуть змінюватися під час мовлення.
+Після завершення фрази створюється фінальний сегмент, який проходить
+PII-redaction і зберігається у протоколі.
+
+Кожен сегмент містить лише сесійний псевдонім (наприклад, «Учасник 3»),
+таймкоди початку й завершення, мову, confidence та статус редагування.
+Фасилітатор може фільтрувати протокол за учасником, мовою і часом, виправляти
+текст із журналюванням аудиту та експортувати результат у Markdown або JSON.
+Фоновий analysis-worker використовує фінальні сегменти для формування тем,
+рішень, ризиків і action items.
 
 ## Project Structure
 
@@ -34,13 +81,27 @@ Proof-of-Concept web app for structured anonymous facilitation sessions.
 - `frontend/` React app
 - `db/migrations/001_init.sql` PostgreSQL schema
 - `docker-compose.yml` local run setup
-- `anonymous-audio-worker/` worker readiness scaffold for anonymous audio processing
+- `anonymous-audio-worker/` worker readiness/runtime-status service
+- `media-worker/` consent-gated LiveKit worker: subscribes only to the private input room, creates transcript segments, and publishes only processed `anonymous`/`masked` audio into the public room
 
 ## Run Locally (Docker Compose)
 
 ```bash
 docker compose up --build
 ```
+
+### GPU transcription
+
+On a host with NVIDIA Container Toolkit, use the CUDA Whisper image without
+changing the normal local CPU setup:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+The override reserves one NVIDIA GPU for `whisper`; set `STT_MODEL` in the
+environment to choose a compatible Faster Whisper model. Benchmark latency and
+accuracy in the target environment before using it for anonymous sessions.
 
 Apps:
 
@@ -64,15 +125,60 @@ Embedded video is enabled only when the backend receives:
 LIVEKIT_URL=wss://livekit.example.com
 LIVEKIT_API_KEY=your-api-key
 LIVEKIT_API_SECRET=your-api-secret
+MEDIA_TOPOLOGY=dual
 ```
+
+`MEDIA_TOPOLOGY=dual` is the privacy-safe voice path: participant raw audio
+goes to `ghosttalk-<code>-input`, while everyone joins the public room and
+receives only processed anonymous audio. Keep `single` only for deployments
+that intentionally use browser-local processing.
 
 For production CSP, set `CSP_CONNECT_SRC` to the exact origins the browser should contact, for example:
 
 ```text
-CSP_CONNECT_SRC='''self'' https://ghost-talk.example.com wss://meet.ghost-talk.example.com'
+CSP_CONNECT_SRC="'self' https://ghost-talk.example.com wss://meet.ghost-talk.example.com"
 ```
 
 Avoid leaving `connect-src` wide open in production.
+
+### Realtime media benchmark
+
+Run the local CPU benchmark without contacting STT/TTS:
+
+```bash
+python3 tools/benchmark_media.py --skip-services --iterations 20
+```
+
+To include the worker-only STT/TTS routes, pass the same internal token used by
+Compose. `--fail-on-thresholds` turns the documented p95 targets into a CI
+gate; it is intentionally opt-in because CPU Whisper latency depends on the
+host:
+
+```bash
+INTERNAL_WORKER_TOKEN=dev-internal python3 tools/benchmark_media.py \
+  --iterations 3 --fail-on-thresholds
+```
+
+Run the static production privacy-boundary check before deployment:
+
+```bash
+python3 tools/security_check.py
+```
+
+Run a read-only concurrent API smoke test before a pilot. It does not create
+sessions or write database state:
+
+```bash
+python3 tools/load_test.py --path /health --path /api/v1/voice-templates \
+  --requests 500 --concurrency 25
+```
+
+Before a production deploy, validate the environment file. The check rejects
+placeholder secrets, non-TLS LiveKit URLs, single-room topology and broad CSP:
+
+```bash
+python3 tools/production_preflight.py --env-file .env.prod
+```
 
 ### Local LiveKit
 
@@ -82,6 +188,27 @@ For local development, the simplest option is the official LiveKit dev server:
 livekit-server --dev --bind 0.0.0.0
 ```
 
+If the shell reports `livekit-server: command not found`, the LiveKit Server
+binary is not installed or is not available in `PATH`. You can verify this with:
+
+```bash
+command -v livekit-server
+```
+
+As an alternative to installing the binary locally, run the official Docker
+image:
+
+```bash
+docker run --rm \
+  -p 7880:7880 \
+  -p 7881:7881 \
+  -p 7882:7882/udp \
+  livekit/livekit-server --dev --bind 0.0.0.0
+```
+
+In either case, keep this process running in a separate terminal while using
+GhostTalk. The local LiveKit server is available at `http://localhost:7880`.
+
 In this mode LiveKit uses the default development credentials:
 
 ```text
@@ -89,10 +216,18 @@ LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=secret
 ```
 
-The local `.env` in this repository is already prepared for this setup:
+GhostTalk's backend runs in Docker, while the browser also uses
+`LIVEKIT_URL`. Therefore this URL must be reachable from **both** the backend
+container and the browser. Do not use `127.0.0.1` (or `localhost`) when
+LiveKit is started separately with `docker run`: from the backend container it
+refers to the backend container itself.
+
+Set `LIVEKIT_URL` to the host's LAN IP address and open GhostTalk using that
+same address. For example, if the Docker host is `10.110.12.212`, put this in
+`.env`:
 
 ```text
-LIVEKIT_URL=ws://127.0.0.1:7880
+LIVEKIT_URL=ws://10.110.12.212:7880
 LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=secret
 ```
@@ -117,11 +252,15 @@ docker compose up -d --build
 docker compose up -d --build backend
 ```
 
-If you open the app from other devices on your LAN, replace `127.0.0.1` in `.env` with the host IP, for example:
+For another host IP, replace `10.110.12.212` above with the address assigned
+to your Docker host. Check it with:
 
-```text
-LIVEKIT_URL=ws://10.110.12.212:7880
+```bash
+hostname -I
 ```
+
+The development server is intentionally unauthenticated apart from its default
+credentials; use it only for local development, not on a public network.
 
 ## Deploy To Remote Server
 

@@ -1,0 +1,16 @@
+services:
+  # Opt-in CUDA profile for the transcription service. Start it with:
+  # docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    environment:
+      WHISPER_MODEL: "${STT_MODEL:-Systran/faster-whisper-small}"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

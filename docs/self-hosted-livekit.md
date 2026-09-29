@@ -40,6 +40,7 @@ Set these values in the GhostTalk backend environment and redeploy:
 LIVEKIT_URL=wss://livekit.example.com
 LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=replace-with-strong-secret
+MEDIA_TOPOLOGY=dual
 ```
 
 ## Notes
@@ -47,3 +48,19 @@ LIVEKIT_API_SECRET=replace-with-strong-secret
 - `LIVEKIT_URL` should be the public websocket endpoint reachable by the browser.
 - API key and secret stay only on the backend.
 - If you want stricter moderation, lobby, egress, SIP, or advanced policies, configure them on the LiveKit side.
+
+### Local Docker bridge note
+
+When LiveKit runs as a separately-created Docker container (for example, the
+dev container published on `172.17.0.1:7880`) while GhostTalk uses Compose,
+Compose services are on a different bridge network. Attach the recreated media
+worker to Docker's built-in bridge after `docker compose up` so WebRTC media
+ICE can reach LiveKit:
+
+```bash
+docker network connect bridge ghost_talk-media-worker-1
+```
+
+The worker `/ready` endpoint now stays `degraded` until its refresh loop has
+successfully connected; this makes a missing bridge attachment visible in
+health checks instead of silently accepting a broken media path.

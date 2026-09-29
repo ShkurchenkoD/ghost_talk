@@ -7,6 +7,7 @@ from urllib import error, request
 from fastapi import FastAPI
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:8080").rstrip("/")
+WORKER_TOKEN = os.environ.get("INTERNAL_WORKER_TOKEN", "").strip()
 SYNC_INTERVAL_SECONDS = max(2, int(os.environ.get("SYNC_INTERVAL_SECONDS", "5")))
 
 app = FastAPI()
@@ -32,6 +33,8 @@ def is_configured(name: str) -> bool:
 def json_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     body = None
     headers = {"Content-Type": "application/json"}
+    if WORKER_TOKEN:
+        headers["X-Internal-Worker-Token"] = WORKER_TOKEN
     if payload is not None:
       import json
       body = json.dumps(payload).encode("utf-8")
@@ -48,8 +51,25 @@ def derive_next_status(item: dict[str, Any]) -> str:
     return "ready"
 
 
+def configured() -> bool:
+    return bool(
+        WORKER_TOKEN
+        and is_configured("LIVEKIT_URL")
+        and is_configured("LIVEKIT_API_KEY")
+        and is_configured("LIVEKIT_API_SECRET")
+        and is_configured("REDIS_URL")
+        and is_configured("STT_MODEL")
+        and is_configured("TTS_PROVIDER")
+    )
+
+
 async def sync_once() -> None:
     metrics = state["metrics"]
+    if not configured():
+        state["last_sync_ok"] = False
+        state["last_error"] = "worker configuration is incomplete"
+        state["last_sync_at"] = time.time()
+        return
     try:
         response = await asyncio.to_thread(json_request, "GET", "/api/internal/anonymous-audio/work-items")
         items = response.get("items") or []
@@ -117,7 +137,7 @@ def ready():
     redis = is_configured("REDIS_URL")
     stt_model = is_configured("STT_MODEL")
     tts_engine = is_configured("TTS_PROVIDER")
-    ready_state = livekit and redis and stt_model and tts_engine and state["last_sync_ok"]
+    ready_state = configured() and livekit and redis and stt_model and tts_engine and state["last_sync_ok"]
     return {
         "status": "ready" if ready_state else "degraded",
         "livekit": livekit,

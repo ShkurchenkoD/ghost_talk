@@ -27,12 +27,16 @@ import {
 } from "livekit-client";
 import {
   createVideoToken,
+  createTranscriptPartial,
+  createTranscriptSegment,
+  getTranscriptConsent,
   getAnonymousAudioStatus,
   getEventsUrl,
   getJoinCaptcha,
   getSession,
   joinSession,
   listVoiceTemplates,
+  setTranscriptConsent,
   updateAnonymousAudio,
 } from "../api/client";
 import { videoDisplayNameKey } from "../api/sessionState";
@@ -40,6 +44,7 @@ import { useI18n } from "../i18n.jsx";
 import {
   AVATAR_OPTIONS,
   AnonymousVideoProcessor,
+  MaskedAudioProcessor,
   SpeechSynthesisAudioProcessor,
   buildAnonymousProfile,
   getDefaultAnonymitySettings,
@@ -164,6 +169,7 @@ function AnonymousModePanel({ settings, busy, error, status, voiceTemplates, onR
         <label>
           <span>{t.videoAnonymousVoiceMode}</span>
           <select value={settings.voiceMode} onChange={(event) => onChange("voiceMode", event.target.value)} disabled={busy}>
+            <option value="masked">{t.videoAnonymousVoiceMasked}</option>
             <option value="synthetic">{t.videoAnonymousVoiceSynthetic}</option>
             <option value="off">{t.videoAnonymousModeOff}</option>
           </select>
@@ -334,23 +340,140 @@ function statusLabelFromState(status, t) {
   }
 }
 
+function MediaStatusPanel({
+  connectionState,
+  inputConnected,
+  mediaTopology,
+  role,
+  cameraEnabled,
+  microphoneEnabled,
+  transcriptConsented,
+  anonymousAudioStatus,
+  room,
+  inputRoom,
+  anonymityEnabled,
+  t,
+}) {
+  const [snapshot, setSnapshot] = useState({ cameraPublished: false, microphonePublished: false });
+
+  useEffect(() => {
+    const refresh = () => {
+      const cameraPublication = room.localParticipant?.getTrackPublication?.(Track.Source.Camera);
+      const microphoneRoom = (microphoneEnabled && mediaTopology === "dual" && role === "participant" && anonymityEnabled)
+        ? inputRoom
+        : room;
+      const microphonePublication = microphoneRoom?.localParticipant?.getTrackPublication?.(Track.Source.Microphone);
+      setSnapshot({
+        cameraPublished: Boolean(cameraPublication?.track),
+        microphonePublished: Boolean(microphonePublication?.track),
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 500);
+    return () => window.clearInterval(timer);
+  }, [anonymityEnabled, inputRoom, mediaTopology, microphoneEnabled, role, room]);
+
+  const connected = connectionState === ConnectionState.Connected;
+  const inputRequired = mediaTopology === "dual" && role === "participant" && anonymityEnabled;
+  const inputReady = !inputRequired || inputConnected;
+  const workerReady = !anonymityEnabled
+    ? "off"
+    : anonymousAudioStatus?.worker_ready === true
+      ? "ready"
+      : anonymousAudioStatus?.worker_ready === false
+        ? "error"
+        : "checking";
+
+  const stateLabel = (state) => {
+    if (state === "ok") return t.videoMediaStatusReady;
+    if (state === "error") return t.videoMediaStatusError;
+    if (state === "off") return t.videoMediaStatusNotApplicable;
+    return t.videoMediaStatusChecking;
+  };
+
+  return (
+    <section className="media-status-card" aria-live="polite">
+      <div className="media-status-heading">
+        <div>
+          <p className="anonymous-mode-eyebrow">{t.videoMediaStatusEyebrow}</p>
+          <strong>{t.videoMediaStatusTitle}</strong>
+        </div>
+        <span className={`media-status-dot${connected && inputReady ? " is-ready" : " is-error"}`} aria-hidden="true" />
+      </div>
+      <dl className="media-status-list">
+        <div>
+          <dt>{t.videoMediaStatusPublicRoom}</dt>
+          <dd className={connected ? "is-ready" : "is-error"}>{connected ? t.videoMediaStatusConnected : String(connectionState || t.videoMediaStatusChecking)}</dd>
+        </div>
+        <div>
+          <dt>{t.videoMediaStatusCamera}</dt>
+          <dd className={cameraEnabled && snapshot.cameraPublished ? "is-ready" : cameraEnabled ? "is-error" : "is-muted"}>
+            {cameraEnabled ? (snapshot.cameraPublished ? t.videoMediaStatusPublished : t.videoMediaStatusMissing) : t.videoMediaStatusDisabled}
+          </dd>
+        </div>
+        <div>
+          <dt>{t.videoMediaStatusMicrophone}</dt>
+          <dd className={microphoneEnabled && snapshot.microphonePublished ? "is-ready" : microphoneEnabled ? "is-error" : "is-muted"}>
+            {microphoneEnabled ? (snapshot.microphonePublished ? t.videoMediaStatusPublished : t.videoMediaStatusMissing) : t.videoMediaStatusDisabled}
+          </dd>
+        </div>
+        {mediaTopology === "dual" && role === "participant" ? (
+          <div>
+            <dt>{t.videoMediaStatusInputRoom}</dt>
+            <dd className={inputConnected ? "is-ready" : inputRequired ? "is-error" : "is-muted"}>
+              {inputConnected ? t.videoMediaStatusConnected : inputRequired ? t.videoMediaStatusDisconnected : t.videoMediaStatusNotApplicable}
+            </dd>
+          </div>
+        ) : null}
+        <div>
+          <dt>{t.videoMediaStatusAnonymity}</dt>
+          <dd className={anonymityEnabled ? "is-ready" : "is-muted"}>{anonymityEnabled ? t.videoMediaStatusEnabled : t.videoMediaStatusDisabled}</dd>
+        </div>
+        {role === "participant" ? (
+          <div>
+            <dt>{t.videoMediaStatusTranscript}</dt>
+            <dd className={transcriptConsented ? "is-ready" : "is-muted"}>{transcriptConsented ? t.videoMediaStatusConsented : t.videoMediaStatusNotConsented}</dd>
+          </div>
+        ) : null}
+        <div>
+          <dt>{t.videoMediaStatusWorker}</dt>
+          <dd className={`is-${workerReady === "ready" ? "ready" : workerReady === "error" ? "error" : workerReady === "off" ? "muted" : "checking"}`}>
+            {stateLabel(workerReady === "ready" ? "ok" : workerReady === "error" ? "error" : workerReady === "off" ? "off" : "checking")}
+          </dd>
+        </div>
+      </dl>
+      {cameraEnabled && !snapshot.cameraPublished && connected ? <p className="media-status-warning">{t.videoMediaStatusCameraWarning}</p> : null}
+    </section>
+  );
+}
+
 function publishedAudioTrackName(settings) {
   return settings.enabled && settings.voiceMode === "synthetic" ? ANONYMOUS_MICROPHONE_TRACK : PUBLIC_MICROPHONE_TRACK;
 }
 
-function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySettings, participantToken, voiceTemplates, t }) {
+function requestedAudioMode(settings) {
+  if (!settings.enabled) return "normal";
+  return settings.voiceMode === "masked" ? "masked" : "anonymous";
+}
+
+function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySettings, participantToken, voiceTemplates, t, mediaTopology = "single", inputRoom = null, inputToken = "", inputServerUrl = "", onAudioModeChange = null }) {
   const room = useRoomContext();
   const connectionState = useConnectionState();
   const [anonymitySettings, setAnonymitySettings] = useState(initialAnonymitySettings);
   const [anonymousAudioStatus, setAnonymousAudioStatus] = useState(null);
+  const [transcriptConsented, setTranscriptConsented] = useState(false);
+  const [liveCaptions, setLiveCaptions] = useState([]);
+  const [partialCaption, setPartialCaption] = useState(null);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [inputConnected, setInputConnected] = useState(mediaTopology !== "dual" || role !== "participant");
   const [error, setError] = useState("");
   const [anonymityPopupOpen, setAnonymityPopupOpen] = useState(false);
   const initializedRef = useRef(false);
   const cameraTrackRef = useRef(null);
   const microphoneTrackRef = useRef(null);
+  const microphoneRoomRef = useRef(room);
   const audioContextRef = useRef(null);
   // Long-lived raw device handles. These are acquired once (on first need)
   // and reused across every anonymity settings change, camera/mic replace,
@@ -363,20 +486,96 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
   const rawCameraTrackRef = useRef(null);
   const rawMicrophoneTrackRef = useRef(null);
   const rawAcquirePendingRef = useRef(null);
+  const transcriptStartedAtRef = useRef(performance.now());
+  const partialCaptionRequestRef = useRef(0);
   const profile = useMemo(
     () => buildAnonymousProfile(`${sessionCode}:${role}:${displayName}`, role),
     [displayName, role, sessionCode],
   );
 
+  const recordTranscript = useCallback(({ text, startedAt, endedAt, language }) => {
+    if (role !== "participant" || !participantToken || !transcriptConsented || !String(text || "").trim()) return;
+    const captionText = String(text).trim();
+    if (partialCaptionRequestRef.current) {
+      window.clearTimeout(partialCaptionRequestRef.current);
+      partialCaptionRequestRef.current = 0;
+    }
+    setPartialCaption(null);
+    const provisionalID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    setLiveCaptions((previous) => [...previous, {
+      id: provisionalID,
+      text: captionText,
+      language: String(language || "").split("-")[0],
+    }].slice(-4));
+    const sessionStartedAt = transcriptStartedAtRef.current;
+    createTranscriptSegment(sessionCode, {
+      segment_key: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+      text: captionText,
+      language: String(language || "").split("-")[0],
+      confidence: 1,
+      started_at_ms: Math.max(0, Math.round(startedAt - sessionStartedAt)),
+      ended_at_ms: Math.max(0, Math.round(endedAt - sessionStartedAt)),
+    }, participantToken).then((result) => {
+      const segment = result.segment;
+      if (!segment?.id) return;
+      setLiveCaptions((previous) => [...previous.filter((caption) => caption.id !== provisionalID && caption.id !== segment.id), {
+        id: segment.id,
+        text: segment.text,
+        language: segment.language || "",
+      }].slice(-4));
+    }).catch((err) => {
+      // Keep the local caption visible even if persistence fails; it is not
+      // retained and disappears with the page.
+      console.warn("[transcript] unable to save final segment", err);
+    });
+  }, [participantToken, role, sessionCode, transcriptConsented]);
+
+  const recordPartialTranscript = useCallback(({ text, language }) => {
+    if (role !== "participant" || !participantToken || !transcriptConsented) return;
+    const captionText = String(text || "").trim();
+    setPartialCaption(captionText ? { text: captionText, language: String(language || "").split("-")[0] } : null);
+    if (partialCaptionRequestRef.current) window.clearTimeout(partialCaptionRequestRef.current);
+    if (!captionText) {
+      partialCaptionRequestRef.current = 0;
+      return;
+    }
+    // Browser STT updates a phrase character-by-character. Debouncing avoids
+    // flooding SSE while retaining the feel of a live caption.
+    partialCaptionRequestRef.current = window.setTimeout(() => {
+      partialCaptionRequestRef.current = 0;
+      createTranscriptPartial(sessionCode, {
+        text: captionText,
+        language: String(language || "").split("-")[0],
+      }, participantToken).catch(() => {});
+    }, 350);
+  }, [participantToken, role, sessionCode, transcriptConsented]);
+
+  useEffect(() => {
+    if (role !== "participant" || !participantToken) return;
+    getTranscriptConsent(sessionCode, participantToken)
+      .then((result) => setTranscriptConsented(Boolean(result.consented)))
+      .catch(() => setTranscriptConsented(false));
+  }, [participantToken, role, sessionCode]);
+
+  const toggleTranscriptConsent = useCallback(async () => {
+    if (!participantToken) return;
+    try {
+      const result = await setTranscriptConsent(sessionCode, !transcriptConsented, participantToken);
+      setTranscriptConsented(Boolean(result.consented));
+    } catch (err) {
+      setError(err.message);
+    }
+  }, [participantToken, sessionCode, transcriptConsented]);
+
   const applyRemoteSubscriptionPolicy = useCallback(() => {
     room.remoteParticipants.forEach((participant) => {
       participant.trackPublications.forEach((publication) => {
         if (publication.kind !== Track.Kind.Audio) return;
-        if (!isWorkerParticipant(participant)) return;
+        if (!isWorkerParticipant(participant) || mediaTopology === "dual") return;
         publication.setSubscribed(false);
       });
     });
-  }, [room]);
+  }, [mediaTopology, room]);
 
   const ensureAudioContext = useCallback(() => {
     if (audioContextRef.current) return audioContextRef.current;
@@ -403,22 +602,39 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
   const acquireRawTracks = useCallback(async (needCamera, needMicrophone) => {
     const needVideo = needCamera && rawCameraTrackRef.current?.readyState !== "live";
     const needAudio = needMicrophone && rawMicrophoneTrackRef.current?.readyState !== "live";
-    if (!needVideo && !needAudio) return;
+    if (!needVideo && !needAudio) return { videoError: null, audioError: null };
 
     if (rawAcquirePendingRef.current) {
       await rawAcquirePendingRef.current;
       return acquireRawTracks(needCamera, needMicrophone);
     }
 
-    const promise = navigator.mediaDevices
-      .getUserMedia({ video: needVideo, audio: needAudio })
-      .then((stream) => {
-        if (needVideo) rawCameraTrackRef.current = stream.getVideoTracks()[0];
-        if (needAudio) rawMicrophoneTrackRef.current = stream.getAudioTracks()[0];
-      });
+    // Request devices separately. getUserMedia({ video: true, audio: true })
+    // rejects the whole request when either device is denied/missing, which
+    // used to make a microphone failure hide an otherwise working camera.
+    const promise = (async () => {
+      const result = { videoError: null, audioError: null };
+      if (needVideo) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          rawCameraTrackRef.current = stream.getVideoTracks()[0] || null;
+        } catch (trackError) {
+          result.videoError = trackError;
+        }
+      }
+      if (needAudio) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+          rawMicrophoneTrackRef.current = stream.getAudioTracks()[0] || null;
+        } catch (trackError) {
+          result.audioError = trackError;
+        }
+      }
+      return result;
+    })();
     rawAcquirePendingRef.current = promise;
     try {
-      await promise;
+      return await promise;
     } finally {
       rawAcquirePendingRef.current = null;
     }
@@ -429,19 +645,28 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       return { cameraTrack: null, microphoneTrack: null };
     }
 
-    await acquireRawTracks(needCamera, needMicrophone);
+    // A static canvas avatar is deliberately independent from the camera: in
+    // that mode the browser must not even request a raw video device track.
+    const needsRawCamera = needCamera && !(settings.enabled && settings.videoMode === "anonymous_mask");
+    const acquireResult = await acquireRawTracks(needsRawCamera, needMicrophone);
 
     let cameraTrack = null;
     let microphoneTrack = null;
 
-    try {
-      if (needCamera) {
+    let cameraError = acquireResult?.videoError || null;
+    let microphoneError = acquireResult?.audioError || null;
+
+    if (needCamera && !cameraError) {
+      try {
         const rawVideoTrack = rawCameraTrackRef.current;
+        if (!rawVideoTrack && !(settings.enabled && settings.videoMode === "anonymous_mask")) {
+          throw new Error("camera track unavailable");
+        }
         if (settings.enabled && settings.videoMode !== "off") {
           const processor = new AnonymousVideoProcessor(profile, settings);
           await processor.init({ track: rawVideoTrack, audioTrack: rawMicrophoneTrackRef.current });
           cameraTrack = attachAnonymousResources(
-            new LocalVideoTrack(processor.processedTrack, rawVideoTrack.getConstraints?.(), true),
+            new LocalVideoTrack(processor.processedTrack, rawVideoTrack?.getConstraints?.(), true),
             { processor },
           );
         } else {
@@ -450,36 +675,66 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
             {},
           );
         }
+      } catch (trackError) {
+        cameraError = trackError;
       }
+    }
 
-      if (needMicrophone) {
+    if (needMicrophone && !microphoneError) {
+      try {
         const rawAudioTrack = rawMicrophoneTrackRef.current;
+        if (!rawAudioTrack) throw new Error("microphone track unavailable");
         const audioContext = ensureAudioContext();
         if (audioContext.state === "suspended") {
           await audioContext.resume().catch(() => {});
         }
-        if (settings.enabled && settings.voiceMode === "synthetic") {
-          const processor = new SpeechSynthesisAudioProcessor(profile, settings);
+        if (mediaTopology === "dual" && role === "participant") {
+          // Raw microphone is confined to the input room. The public room
+          // receives only the worker's redacted/synthesized track.
+          microphoneTrack = new LocalAudioTrack(rawAudioTrack, rawAudioTrack.getConstraints?.(), true, audioContext);
+        } else if (settings.enabled && settings.voiceMode === "masked") {
+          const processor = new MaskedAudioProcessor(settings);
           await processor.init({ track: rawAudioTrack, audioContext });
           microphoneTrack = attachAnonymousResources(
             new LocalAudioTrack(processor.processedTrack, rawAudioTrack.getConstraints?.(), true, audioContext),
             { processor },
           );
+        } else if (settings.enabled && settings.voiceMode === "synthetic") {
+          const processor = new SpeechSynthesisAudioProcessor(profile, settings, {
+            onTranscript: recordTranscript,
+            onPartialTranscript: recordPartialTranscript,
+          });
+          await processor.init({ track: rawAudioTrack, audioContext });
+          microphoneTrack = attachAnonymousResources(
+            new LocalAudioTrack(processor.processedTrack, rawAudioTrack.getConstraints?.(), true, audioContext),
+            { processor },
+          );
+        } else if (settings.enabled) {
+          // Fail closed: anonymous mode never substitutes the original voice.
+          microphoneTrack = null;
         } else {
           microphoneTrack = attachAnonymousResources(
             new LocalAudioTrack(rawAudioTrack, rawAudioTrack.getConstraints?.(), true, audioContext),
             {},
           );
         }
+      } catch (trackError) {
+        microphoneError = trackError;
       }
-
-      return { cameraTrack, microphoneTrack };
-    } catch (trackError) {
-      await discardGeneratedTrack(cameraTrack);
-      await discardGeneratedTrack(microphoneTrack);
-      throw trackError;
     }
-  }, [acquireRawTracks, ensureAudioContext, profile]);
+
+    if (cameraError) {
+      await discardGeneratedTrack(microphoneTrack);
+      throw cameraError;
+    }
+    if (microphoneError) {
+      await discardGeneratedTrack(microphoneTrack);
+      // Anonymous voice must fail closed, but a browser audio API failure
+      // must not remove an otherwise valid raw/anonymized camera track.
+    }
+
+    return { cameraTrack, microphoneTrack, cameraError, microphoneError };
+  }, [acquireRawTracks, ensureAudioContext, mediaTopology, profile, recordPartialTranscript, recordTranscript, role]);
 
   const replacePublishedTrack = useCallback(async (currentTrack, nextTrack) => {
     if (!currentTrack || !nextTrack) {
@@ -504,7 +759,7 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
   }, []);
 
   const rebuildPublishedMedia = useCallback(async (settings, nextCameraEnabled, nextMicrophoneEnabled) => {
-    const { cameraTrack, microphoneTrack } = await createManagedTracks(
+    const { cameraTrack, microphoneTrack, microphoneError } = await createManagedTracks(
       nextCameraEnabled,
       nextMicrophoneEnabled,
       settings,
@@ -518,17 +773,43 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
           await room.localParticipant.publishTrack(cameraTrack, { source: Track.Source.Camera, name: "camera-public" });
           cameraTrackRef.current = cameraTrack;
         }
+        // Switching to a static avatar must also turn off a camera acquired
+        // by a previous blur/pixel/normal mode.
+        if (settings.enabled && settings.videoMode === "anonymous_mask") {
+          releaseRawTrack("video");
+        }
       } else if (cameraTrackRef.current) {
         await disposeTrack(room, cameraTrackRef.current, () => releaseRawTrack("video"));
         cameraTrackRef.current = null;
       }
 
-      if (nextMicrophoneEnabled) {
+      if (microphoneError) {
+        setMicrophoneEnabled(false);
+        if (settings.enabled) setError(t.videoAnonymousError);
+      }
+
+      const targetMicrophoneRoom = mediaTopology === "dual" && role === "participant" && settings.enabled ? inputRoom : room;
+      if (nextMicrophoneEnabled && microphoneTrackRef.current && microphoneRoomRef.current !== targetMicrophoneRoom) {
+        await disposeTrack(microphoneRoomRef.current, microphoneTrackRef.current, null);
+        microphoneTrackRef.current = null;
+      }
+      if (nextMicrophoneEnabled && !microphoneTrack && settings.enabled && !(mediaTopology === "dual" && role === "participant")) {
+        // Anonymous mode must fail closed. A disabled/failed synthetic pipeline
+        // is mute; it must never retain or publish the raw microphone track.
+        setMicrophoneEnabled(false);
+        setError(t.videoAnonymousError);
+        if (microphoneTrackRef.current) {
+          await disposeTrack(room, microphoneTrackRef.current, () => releaseRawTrack("audio"));
+          microphoneTrackRef.current = null;
+        }
+      } else if (nextMicrophoneEnabled) {
         if (microphoneTrackRef.current && microphoneTrack) {
           microphoneTrackRef.current = await replacePublishedTrack(microphoneTrackRef.current, microphoneTrack);
         } else if (!microphoneTrackRef.current && microphoneTrack) {
-          await room.localParticipant.publishTrack(microphoneTrack, { source: Track.Source.Microphone, name: publishedAudioTrackName(settings) });
+          if (!targetMicrophoneRoom) throw new Error("input room unavailable");
+          await targetMicrophoneRoom.localParticipant.publishTrack(microphoneTrack, { source: Track.Source.Microphone, name: publishedAudioTrackName(settings) });
           microphoneTrackRef.current = microphoneTrack;
+          microphoneRoomRef.current = targetMicrophoneRoom;
         }
       } else if (microphoneTrackRef.current) {
         await disposeTrack(room, microphoneTrackRef.current, () => releaseRawTrack("audio"));
@@ -543,19 +824,38 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       }
       throw rebuildError;
     }
-  }, [createManagedTracks, releaseRawTrack, replacePublishedTrack, room]);
+  }, [createManagedTracks, inputRoom, mediaTopology, releaseRawTrack, replacePublishedTrack, role, room, t.videoAnonymousError]);
 
   const applyAnonymitySettings = useCallback(async (nextSettings) => {
     setBusy(true);
     setError("");
     try {
       const sanitized = sanitizeAnonymitySettings(nextSettings);
+      const previousAudioMode = requestedAudioMode(anonymitySettings);
+      const nextAudioMode = requestedAudioMode(sanitized);
+      // In dual topology the public-room JWT explicitly lists publishable
+      // sources. Refresh it before moving the microphone between rooms so a
+      // normal-mode participant can publish to the public room and an
+      // anonymous/masked participant cannot retain that capability.
+      if (
+        role === "participant" &&
+        mediaTopology === "dual" &&
+        previousAudioMode !== nextAudioMode &&
+        onAudioModeChange
+      ) {
+        const refreshedToken = await onAudioModeChange(nextAudioMode);
+        if (!refreshedToken || typeof room.updateToken !== "function") {
+          throw new Error("public room token refresh unavailable");
+        }
+        await room.updateToken(refreshedToken);
+      }
       if (role === "participant" && participantToken) {
         const statusRes = await updateAnonymousAudio(sessionCode, {
           enabled: sanitized.enabled,
           language_mode: sanitized.languageMode,
           preferred_language: sanitized.preferredLanguage,
           voice_template_id: sanitized.voiceTemplateId,
+          audio_mode: requestedAudioMode(sanitized),
           pii_redaction_enabled: false,
         }, participantToken);
         setAnonymousAudioStatus({ ...statusRes, status_label: statusLabelFromState(statusRes.status, t) });
@@ -575,6 +875,10 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
     participantToken,
     rebuildPublishedMedia,
     role,
+    mediaTopology,
+    anonymitySettings,
+    onAudioModeChange,
+    room,
     sessionCode,
     t,
     t.videoAnonymousError,
@@ -584,8 +888,12 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
     const nextSettings = sanitizeAnonymitySettings({
       ...anonymitySettings,
       [field]: value,
-      enabled: field === "enabled" ? value : true,
+      enabled: field === "enabled" ? value : anonymitySettings.enabled,
     });
+    if (field !== "enabled") {
+      nextSettings.enabled = nextSettings.videoMode !== "off" || nextSettings.voiceMode !== "off";
+      nextSettings.audioMode = nextSettings.enabled ? "anonymous" : "normal";
+    }
     applyAnonymitySettings(nextSettings);
   }, [anonymitySettings, applyAnonymitySettings]);
 
@@ -626,8 +934,11 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       } else {
         const { microphoneTrack } = await createManagedTracks(false, true, anonymitySettings);
         if (microphoneTrack) {
-          await room.localParticipant.publishTrack(microphoneTrack, { source: Track.Source.Microphone, name: publishedAudioTrackName(anonymitySettings) });
+          const targetRoom = mediaTopology === "dual" && role === "participant" && anonymitySettings.enabled ? inputRoom : room;
+          if (!targetRoom) throw new Error("input room unavailable");
+          await targetRoom.localParticipant.publishTrack(microphoneTrack, { source: Track.Source.Microphone, name: publishedAudioTrackName(anonymitySettings) });
           microphoneTrackRef.current = microphoneTrack;
+          microphoneRoomRef.current = targetRoom;
           setMicrophoneEnabled(true);
         }
       }
@@ -637,10 +948,28 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
     } finally {
       setBusy(false);
     }
-  }, [anonymitySettings, busy, createManagedTracks, microphoneEnabled, releaseRawTrack, room, t.videoAnonymousError]);
+  }, [anonymitySettings, busy, createManagedTracks, inputRoom, mediaTopology, microphoneEnabled, releaseRawTrack, role, room, t.videoAnonymousError]);
 
   useEffect(() => {
-    if (connectionState !== ConnectionState.Connected || initializedRef.current) return;
+    if (mediaTopology !== "dual" || role !== "participant" || !inputRoom || !inputToken || !inputServerUrl) return undefined;
+    let cancelled = false;
+    inputRoom.connect(inputServerUrl, inputToken, { autoSubscribe: false }).then(() => {
+      if (!cancelled) setInputConnected(true);
+    }).catch(() => {
+      // Normal public audio/video does not depend on the private input room.
+      // Keep the diagnostic error scoped to modes that actually require it.
+      if (!cancelled && anonymitySettings.enabled) setError(t.videoAnonymousError);
+    });
+    return () => {
+      cancelled = true;
+      setInputConnected(false);
+      inputRoom.disconnect().catch(() => {});
+    };
+  }, [anonymitySettings.enabled, inputRoom, inputServerUrl, inputToken, mediaTopology, role, t.videoAnonymousError]);
+
+  useEffect(() => {
+    const inputRequired = mediaTopology === "dual" && role === "participant" && anonymitySettings.enabled;
+    if (connectionState !== ConnectionState.Connected || (inputRequired && !inputConnected) || initializedRef.current) return;
     initializedRef.current = true;
     rebuildPublishedMedia(anonymitySettings, true, true).catch((err) => {
       console.error(err);
@@ -648,7 +977,7 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       setCameraEnabled(false);
       setMicrophoneEnabled(false);
     });
-  }, [anonymitySettings, connectionState, rebuildPublishedMedia, t.videoAnonymousError]);
+  }, [anonymitySettings, connectionState, inputConnected, mediaTopology, rebuildPublishedMedia, role, t.videoAnonymousError]);
 
   useEffect(() => {
     if (connectionState !== ConnectionState.Connected) return undefined;
@@ -699,6 +1028,23 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
     const es = new EventSource(getEventsUrl(sessionCode));
     es.onmessage = (event) => {
       const msg = JSON.parse(event.data);
+      if (msg?.type === "transcript.segment.partial" && role === "participant") {
+        const segment = msg.payload || {};
+        setPartialCaption(segment.text ? { text: segment.text, language: segment.language || "" } : null);
+        return;
+      }
+      if (msg?.type === "transcript.segment.final" && role === "participant") {
+        const segment = msg.payload || {};
+        setPartialCaption(null);
+        if (segment.text) {
+          setLiveCaptions((previous) => [...previous.filter((caption) => caption.id !== segment.id), {
+            id: segment.id,
+            text: segment.text,
+            language: segment.language || "",
+          }].slice(-4));
+        }
+        return;
+      }
       if (!String(msg?.type || "").startsWith("anonymous_audio.")) return;
       const payload = msg.payload || {};
       setAnonymousAudioStatus((prev) => ({
@@ -708,7 +1054,11 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       }));
     };
     return () => es.close();
-  }, [sessionCode, t]);
+  }, [role, sessionCode, t]);
+
+  useEffect(() => () => {
+    if (partialCaptionRequestRef.current) window.clearTimeout(partialCaptionRequestRef.current);
+  }, []);
 
   useEffect(() => {
     if (role !== "participant" || !participantToken) return undefined;
@@ -733,7 +1083,7 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
   useEffect(() => () => {
     Promise.allSettled([
       disposeTrack(room, cameraTrackRef.current, () => releaseRawTrack("video")),
-      disposeTrack(room, microphoneTrackRef.current, () => releaseRawTrack("audio")),
+      disposeTrack(microphoneRoomRef.current || room, microphoneTrackRef.current, () => releaseRawTrack("audio")),
     ]);
     cameraTrackRef.current = null;
     microphoneTrackRef.current = null;
@@ -753,6 +1103,20 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
       t={t}
     />
   );
+  const mediaStatusPanelProps = {
+    connectionState,
+    inputConnected,
+    mediaTopology,
+    role,
+    cameraEnabled,
+    microphoneEnabled,
+    transcriptConsented,
+    anonymousAudioStatus,
+    room,
+    inputRoom,
+    anonymityEnabled: anonymitySettings.enabled,
+    t,
+  };
 
   return (
     <div className="video-room-layout">
@@ -767,7 +1131,30 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
         t={t}
         participantFilter={(participant) => !isWorkerParticipant(participant)}
       />
-      <aside className="video-room-sidebar">{anonymityPanel}</aside>
+      <aside className="video-room-sidebar">
+        <MediaStatusPanel {...mediaStatusPanelProps} />
+        {anonymityPanel}
+        {role === "participant" ? (
+          <>
+            <section className="anonymous-mode-card">
+              <strong>Транскрипція зустрічі</strong>
+              <p>Фінальні фрази зберігатимуться в анонімному текстовому протоколі.</p>
+              <button type="button" className="btn" onClick={toggleTranscriptConsent}>
+                {transcriptConsented ? "Відкликати згоду" : "Дозволити транскрипцію"}
+              </button>
+            </section>
+            {transcriptConsented && (
+              <section className="anonymous-mode-card" aria-live="polite">
+                <strong>Ваші live captions</strong>
+                {liveCaptions.length === 0 ? <p>Розпізнані фрази з’являться тут.</p> : liveCaptions.map((caption) => (
+                  <p key={caption.id}><small>{caption.language || "auto"}</small><br />{caption.text}</p>
+                ))}
+                {partialCaption && <p><small>{partialCaption.language || "auto"} · розпізнається</small><br />{partialCaption.text}</p>}
+              </section>
+            )}
+          </>
+        ) : null}
+      </aside>
       <button
         type="button"
         className="anonymous-mode-fab"
@@ -786,6 +1173,7 @@ function ManagedVideoRoom({ sessionCode, role, displayName, initialAnonymitySett
             >
               {t.videoAnonymousClosePanel}
             </button>
+            <MediaStatusPanel {...mediaStatusPanelProps} />
             {anonymityPanel}
           </div>
         </div>
@@ -804,6 +1192,7 @@ export default function VideoRoomPage() {
   const [authToken, setAuthToken] = useState("");
   const [participantToken, setParticipantToken] = useState("");
   const [facilitatorToken, setFacilitatorToken] = useState("");
+  const [inputToken, setInputToken] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -813,6 +1202,7 @@ export default function VideoRoomPage() {
   const [captchaQuestion, setCaptchaQuestion] = useState("");
   const [captchaAnswer, setCaptchaAnswer] = useState("");
   const room = useMemo(() => new Room(), []);
+  const inputRoom = useMemo(() => new Room(), []);
 
   useEffect(() => {
     const savedName = localStorage.getItem(videoDisplayNameKey(sessionCode, normalizedRole)) || defaultDisplayName(normalizedRole, t);
@@ -828,8 +1218,12 @@ export default function VideoRoomPage() {
       const next = sanitizeAnonymitySettings({
         ...prev,
         [field]: value,
-        enabled: field === "enabled" ? value : true,
+        enabled: field === "enabled" ? value : prev.enabled,
       });
+      if (field !== "enabled") {
+        next.enabled = next.videoMode !== "off" || next.voiceMode !== "off";
+        next.audioMode = next.enabled ? "anonymous" : "normal";
+      }
       persistAnonymitySettings(sessionCode, normalizedRole, next);
       return next;
     });
@@ -878,9 +1272,10 @@ export default function VideoRoomPage() {
       const headers = normalizedRole === "facilitator"
         ? { "X-Facilitator-Token": facilitatorToken }
         : { "X-Participant-Token": token };
-      const res = await createVideoToken(sessionCode, { display_name: trimmedName, audio_mode: anonymitySettings.enabled ? "anonymous" : "normal" }, headers);
+      const res = await createVideoToken(sessionCode, { display_name: trimmedName, audio_mode: requestedAudioMode(anonymitySettings) }, headers);
       localStorage.setItem(videoDisplayNameKey(sessionCode, normalizedRole), trimmedName);
       setAuthToken(res.token);
+      setInputToken(res.input_token || "");
     } catch (err) {
       setError(err.message);
       if (normalizedRole !== "facilitator") {
@@ -891,6 +1286,23 @@ export default function VideoRoomPage() {
       setConnecting(false);
     }
   }
+
+  const refreshVideoTokenForAudioMode = useCallback(async (audioMode) => {
+    if (!session || !authToken) return "";
+    const headers = normalizedRole === "facilitator"
+      ? { "X-Facilitator-Token": facilitatorToken }
+      : { "X-Participant-Token": participantToken };
+    const res = await createVideoToken(sessionCode, {
+      display_name: displayName.trim(),
+      audio_mode: audioMode,
+    }, headers);
+    setAuthToken(res.token);
+    // Keep the existing input-room token/connection stable while the public
+    // room permissions are refreshed. Replacing input_token here would cause
+    // the input-room effect to disconnect and reconnect in the middle of a
+    // microphone handoff.
+    return res.token;
+  }, [authToken, displayName, facilitatorToken, normalizedRole, participantToken, session, sessionCode]);
 
   const backHref = normalizedRole === "facilitator" ? `/facilitator/${sessionCode}` : `/session/${sessionCode}`;
 
@@ -975,6 +1387,11 @@ export default function VideoRoomPage() {
             participantToken={participantToken}
             voiceTemplates={voiceTemplates}
             t={t}
+            mediaTopology={session.media_topology || "single"}
+            inputRoom={inputRoom}
+            inputToken={inputToken}
+            inputServerUrl={session.video_server_url}
+            onAudioModeChange={refreshVideoTokenForAudioMode}
           />
         </LiveKitRoom>
       </div>

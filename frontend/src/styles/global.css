@@ -311,6 +311,133 @@ select {
   background: rgba(15, 23, 42, 0.4);
 }
 
+.media-status-card {
+  display: grid;
+  gap: 0.65rem;
+  margin-bottom: 0.75rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(125, 211, 252, 0.32);
+  border-radius: 0.95rem;
+  background: rgba(15, 23, 42, 0.78);
+  color: #e2e8f0;
+}
+
+.media-status-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.media-status-heading .anonymous-mode-eyebrow {
+  margin-bottom: 0.15rem;
+  color: #67e8f9;
+}
+
+.media-status-dot {
+  flex: 0 0 auto;
+  width: 0.62rem;
+  height: 0.62rem;
+  margin-top: 0.2rem;
+  border-radius: 50%;
+  background: #f87171;
+  box-shadow: 0 0 0 0.2rem rgba(248, 113, 113, 0.12);
+}
+
+.media-status-dot.is-ready {
+  background: #4ade80;
+  box-shadow: 0 0 0 0.2rem rgba(74, 222, 128, 0.12);
+}
+
+.media-status-list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.media-status-list > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.media-status-list dt,
+.media-status-list dd {
+  margin: 0;
+  font-size: 0.74rem;
+  line-height: 1.25;
+}
+
+.media-status-list dt {
+  color: #94a3b8;
+}
+
+.media-status-list dd {
+  overflow: hidden;
+  color: #cbd5e1;
+  font-weight: 700;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-status-list dd.is-ready {
+  color: #86efac;
+}
+
+.media-status-list dd.is-error {
+  color: #fca5a5;
+}
+
+.media-status-list dd.is-checking {
+  color: #fde68a;
+}
+
+.media-status-list dd.is-muted {
+  color: #94a3b8;
+}
+
+.media-status-warning {
+  margin: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 0.65rem;
+  background: rgba(120, 53, 15, 0.3);
+  color: #fde68a;
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.transcript-segment-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.transcript-segment-flags {
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.transcript-flag {
+  padding: 0.16rem 0.4rem;
+  border: 1px solid #bae6fd;
+  border-radius: 999px;
+  background: #f0f9ff;
+  color: #0369a1;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.transcript-flag.is-warning {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
 .anonymous-mode-fab {
   display: none;
   position: absolute;

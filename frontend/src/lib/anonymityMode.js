@@ -17,7 +17,7 @@ const DEFAULT_ANONYMITY_SETTINGS = {
 };
 
 const VIDEO_ANONYMITY_MODES = new Set(["off", "face_blur", "face_pixelation", "anonymous_mask"]);
-const VOICE_ANONYMITY_MODES = new Set(["off", "synthetic"]);
+const VOICE_ANONYMITY_MODES = new Set(["off", "masked", "synthetic"]);
 const LANGUAGE_MODES = new Set(["auto", "manual"]);
 const PREFERRED_LANGUAGES = new Set(["uk-UA", "en-US", "pl-PL", "ru-RU"]);
 const AVATAR_IDS = new Set(Array.from({ length: 16 }, (_, index) => String(index + 1)));
@@ -253,7 +253,7 @@ export class AnonymousVideoProcessor {
 
   async restart(opts) {
     await this.destroy();
-    const settings = opts.track.getSettings?.() || {};
+    const settings = opts.track?.getSettings?.() || {};
     const width = settings.width || DEFAULT_WIDTH;
     const height = settings.height || DEFAULT_HEIGHT;
     const canvas = document.createElement("canvas");
@@ -264,16 +264,18 @@ export class AnonymousVideoProcessor {
     this.startedAt = performance.now();
     this.stream = canvas.captureStream(VIDEO_FPS);
     this.processedTrack = this.stream.getVideoTracks()[0];
-    this.video = document.createElement("video");
-    this.video.autoplay = true;
-    this.video.muted = true;
-    this.video.playsInline = true;
-    this.video.srcObject = new MediaStream([opts.track]);
-    await this.video.play().catch(() => {});
+    if (opts.track) {
+      this.video = document.createElement("video");
+      this.video.autoplay = true;
+      this.video.muted = true;
+      this.video.playsInline = true;
+      this.video.srcObject = new MediaStream([opts.track]);
+      await this.video.play().catch(() => {});
+    }
     this.connectAudioAnalyser(opts.audioTrack);
     await this.ensureAvatarImage();
 
-    if (typeof window !== "undefined" && "FaceDetector" in window) {
+    if (this.video && typeof window !== "undefined" && "FaceDetector" in window) {
       try {
         this.faceDetector = new window.FaceDetector({
           fastMode: true,
@@ -298,19 +300,20 @@ export class AnonymousVideoProcessor {
     const { width, height } = this.canvas;
     const ctx = this.ctx;
     const mode = this.settings.videoMode;
-    if (!this.video) return;
-
     ctx.clearRect(0, 0, width, height);
 
     if (mode === "face_blur") {
+      if (!this.video) return;
       this.renderBlurMask(ctx, width, height);
       return;
     }
     if (mode === "face_pixelation") {
+      if (!this.video) return;
       this.renderPixelMask(ctx, width, height);
       return;
     }
     if (mode !== "anonymous_mask") {
+      if (!this.video) return;
       ctx.drawImage(this.video, 0, 0, width, height);
       return;
     }
@@ -575,13 +578,68 @@ export class AnonymousVideoProcessor {
   }
 }
 
+// Low-latency voice mask. This is deliberately a separate mode from synthetic:
+// the server-side dual-room worker applies a streaming timbre transform while
+// keeping the raw microphone confined to the input room.
+export class MaskedAudioProcessor {
+  constructor(settings = DEFAULT_ANONYMITY_SETTINGS) {
+    this.settings = sanitizeAnonymitySettings(settings);
+    this.audioContext = undefined;
+    this.source = undefined;
+    this.destination = undefined;
+    this.nodes = [];
+    this.processedTrack = undefined;
+  }
+
+  async init(opts) {
+    await this.destroy();
+    const audioContext = opts.audioContext;
+    if (audioContext.state === "suspended") await audioContext.resume().catch(() => {});
+    this.audioContext = audioContext;
+    this.source = audioContext.createMediaStreamSource(new MediaStream([opts.track]));
+    const highpass = audioContext.createBiquadFilter();
+    highpass.type = "highpass";
+    highpass.frequency.value = 140;
+    const lowpass = audioContext.createBiquadFilter();
+    lowpass.type = "lowpass";
+    lowpass.frequency.value = 3400;
+    const shaper = audioContext.createWaveShaper();
+    const curve = new Float32Array(257);
+    for (let index = 0; index < curve.length; index += 1) {
+      const x = (index * 2) / (curve.length - 1) - 1;
+      curve[index] = Math.tanh(x * 2.8) * 0.82;
+    }
+    shaper.curve = curve;
+    shaper.oversample = "2x";
+    const compressor = audioContext.createDynamicsCompressor();
+    compressor.threshold.value = -26;
+    compressor.knee.value = 18;
+    compressor.ratio.value = 6;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.12;
+    this.destination = audioContext.createMediaStreamDestination();
+    this.source.connect(highpass).connect(lowpass).connect(shaper).connect(compressor).connect(this.destination);
+    this.nodes = [highpass, lowpass, shaper, compressor];
+    this.processedTrack = this.destination.stream.getAudioTracks()[0];
+  }
+
+  async destroy() {
+    try { this.source?.disconnect(); } catch (_) { /* already disconnected */ }
+    this.nodes.forEach((node) => { try { node.disconnect(); } catch (_) { /* noop */ } });
+    this.source = undefined;
+    this.nodes = [];
+    this.destination = undefined;
+    this.processedTrack = undefined;
+  }
+}
+
 // Strongest anonymity mode: recognizes speech (STT) and replaces the outgoing
 // audio entirely with synthesized speech (TTS) in a fixed anonymous voice, so
 // no part of the original waveform (and its voice biometrics) ever leaves the
 // browser. Trades real-time responsiveness for that guarantee: each utterance
 // only reaches the other participants after STT+TTS round-trips complete.
 export class SpeechSynthesisAudioProcessor {
-  constructor(profile, settings = DEFAULT_ANONYMITY_SETTINGS) {
+  constructor(profile, settings = DEFAULT_ANONYMITY_SETTINGS, options = {}) {
     this.name = "ghosttalk-speech-synthesis-audio";
     this.profile = profile;
     this.settings = sanitizeAnonymitySettings(settings);
@@ -611,6 +669,8 @@ export class SpeechSynthesisAudioProcessor {
     this.playQueue = Promise.resolve();
     this.activeSource = undefined;
     this.voiceId = pickSyntheticVoice(profile, this.settings);
+    this.onTranscript = typeof options.onTranscript === "function" ? options.onTranscript : null;
+    this.onPartialTranscript = typeof options.onPartialTranscript === "function" ? options.onPartialTranscript : null;
   }
 
   async init(opts) {
@@ -722,7 +782,9 @@ export class SpeechSynthesisAudioProcessor {
     const recognition = new SpeechRecognitionCtor();
     recognition.lang = locale;
     recognition.continuous = true;
-    recognition.interimResults = false;
+    // Interim browser STT is intentionally local-only. It makes captions feel
+    // live without retaining or broadcasting text that may later be revised.
+    recognition.interimResults = true;
     recognition.maxAlternatives = 1;
     recognition.onresult = (event) => {
       this.gotNativeResult = true;
@@ -730,9 +792,14 @@ export class SpeechSynthesisAudioProcessor {
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
         debugShow(`result[${index}] final=${result.isFinal} text="${result[0]?.transcript}"`);
-        if (!result.isFinal) continue;
         const transcript = result[0]?.transcript?.trim();
-        if (transcript) this.enqueueUtteranceText(transcript);
+        if (!transcript) continue;
+        if (!result.isFinal) {
+          this.emitPartialTranscript(transcript);
+          continue;
+        }
+        this.emitPartialTranscript("");
+        this.enqueueUtteranceText(transcript);
       }
     };
     recognition.onerror = (event) => {
@@ -779,6 +846,7 @@ export class SpeechSynthesisAudioProcessor {
   async processUtteranceText(text) {
     debugShow(`processUtteranceText text="${text}"`);
     if (this.destroyed || !text) return;
+    this.emitTranscript(text, performance.now() - 500, performance.now());
     const audioData = await synthesizeSpeech(text, this.voiceId).catch((err) => {
       console.warn("[anonymity] synthesis failed", err);
       debugShow(`synthesis failed ${err?.message}`);
@@ -865,6 +933,7 @@ export class SpeechSynthesisAudioProcessor {
     const chunks = this.recordedChunks;
     const mimeType = recorder.mimeType || "audio/webm";
     const extension = this.recordingExtension || "webm";
+    const startedAt = this.speechStartedAt;
     // Note: this.recordedChunks is intentionally left as-is here — `ondataavailable`
     // (still wired from startUtterance) fires on stop() and pushes the final blob
     // into it before `onstop` runs below. Reassigning it here would orphan that
@@ -875,7 +944,7 @@ export class SpeechSynthesisAudioProcessor {
       debugShow(`endUtterance tooShort=${tooShort} chunks=${chunks.length}`);
       if (tooShort || this.destroyed || chunks.length === 0) return;
       const blob = new Blob(chunks, { type: mimeType });
-      this.enqueueUtterance(blob, extension);
+      this.enqueueUtterance(blob, extension, startedAt);
     };
     try {
       recorder.stop();
@@ -884,13 +953,13 @@ export class SpeechSynthesisAudioProcessor {
     }
   }
 
-  enqueueUtterance(blob, extension) {
+  enqueueUtterance(blob, extension, startedAt) {
     this.playQueue = this.playQueue
-      .then(() => this.processUtterance(blob, extension))
+      .then(() => this.processUtterance(blob, extension, startedAt))
       .catch(() => {});
   }
 
-  async processUtterance(blob, extension) {
+  async processUtterance(blob, extension, startedAt) {
     debugShow(`processUtterance blob size=${blob.size}`);
     if (this.destroyed) return;
     const lang = String(this.settings.preferredLanguage || "").trim().toLowerCase().split("-")[0] || currentSyntheticLang();
@@ -906,6 +975,8 @@ export class SpeechSynthesisAudioProcessor {
       debugShow("transcribed text empty");
       return;
     }
+
+    this.emitTranscript(text.trim(), startedAt || performance.now() - 500, performance.now());
 
     debugShow(`synthesize start voice=${this.voiceId}`);
     const audioData = await synthesizeSpeech(text.trim(), this.voiceId).catch((err) => {
@@ -943,6 +1014,24 @@ export class SpeechSynthesisAudioProcessor {
       this.activeSource = source;
       source.start();
     });
+  }
+
+  emitTranscript(text, startedAt, endedAt) {
+    if (!this.onTranscript || this.destroyed) return;
+    try {
+      this.onTranscript({ text, startedAt, endedAt, language: this.settings.preferredLanguage });
+    } catch (_) {
+      // Transcript delivery must never interrupt anonymous audio playback.
+    }
+  }
+
+  emitPartialTranscript(text) {
+    if (!this.onPartialTranscript || this.destroyed) return;
+    try {
+      this.onPartialTranscript({ text, language: this.settings.preferredLanguage });
+    } catch (_) {
+      // Captions must never interrupt anonymous audio playback.
+    }
   }
 
   async destroy() {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +36,9 @@ type Server struct {
 	whisperURL              string
 	ttsURL                  string
 	anonymousAudioWorkerURL string
+	analysisWorkerURL       string
+	mediaTopology           string
+	internalWorkerToken     string
 	livekitURL              string
 	apiKey                  string
 	apiSecret               string
@@ -44,7 +49,12 @@ type Server struct {
 	httpClient              *http.Client
 }
 
-func New(st *store.Store, hub *realtime.Hub, whisperURL, ttsURL, anonymousAudioWorkerURL, livekitURL, apiKey, apiSecret string, facilitatorTTL, participantTTL time.Duration, allowedOrigins []string) *Server {
+var (
+	transcriptEmailPattern = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	transcriptPhonePattern = regexp.MustCompile(`(?:\+\d{1,3}[\s().-]?)?(?:\d{2,3}[\s().-]?){2}\d{2}[\s().-]?\d{2}\b`)
+)
+
+func New(st *store.Store, hub *realtime.Hub, whisperURL, ttsURL, anonymousAudioWorkerURL, analysisWorkerURL, mediaTopology, livekitURL, apiKey, apiSecret, internalWorkerToken string, facilitatorTTL, participantTTL time.Duration, allowedOrigins []string) *Server {
 	s := &Server{
 		store:                   st,
 		hub:                     hub,
@@ -52,6 +62,9 @@ func New(st *store.Store, hub *realtime.Hub, whisperURL, ttsURL, anonymousAudioW
 		whisperURL:              whisperURL,
 		ttsURL:                  ttsURL,
 		anonymousAudioWorkerURL: strings.TrimRight(strings.TrimSpace(anonymousAudioWorkerURL), "/"),
+		analysisWorkerURL:       strings.TrimRight(strings.TrimSpace(analysisWorkerURL), "/"),
+		mediaTopology:           normalizeMediaTopology(mediaTopology),
+		internalWorkerToken:     strings.TrimSpace(internalWorkerToken),
 		livekitURL:              strings.TrimRight(strings.TrimSpace(livekitURL), "/"),
 		apiKey:                  strings.TrimSpace(apiKey),
 		apiSecret:               strings.TrimSpace(apiSecret),
@@ -81,6 +94,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/v1/rooms/", s.handleAnonymousAudioRoutes)
 	s.mux.HandleFunc("/api/internal/anonymous-audio/work-items", s.handleAnonymousAudioWorkItems)
 	s.mux.HandleFunc("/api/internal/anonymous-audio/runtime", s.handleAnonymousAudioRuntime)
+	s.mux.HandleFunc("/api/internal/transcript-segments", s.handleInternalTranscriptSegments)
+	s.mux.HandleFunc("/api/internal/transcript-work-items", s.handleTranscriptWorkItems)
+	s.mux.HandleFunc("/api/internal/transcribe", s.handleInternalTranscribe)
+	s.mux.HandleFunc("/api/internal/synthesize", s.handleInternalSynthesize)
+	s.mux.HandleFunc("/api/internal/analysis/", s.handleInternalAnalysisRoutes)
+	s.mux.HandleFunc("/api/transcript-segments/", s.handleTranscriptSegmentRoutes)
+	s.mux.HandleFunc("/api/action-items/", s.handleActionItemRoutes)
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +195,14 @@ func (s *Server) handleSessionRoutes(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionByCode(w, r, code)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "transcript" && parts[2] == "export" {
+		s.handleTranscriptExport(w, r, code)
+		return
+	}
+	if len(parts) != 2 {
+		writeError(w, r, http.StatusNotFound, "not found")
+		return
+	}
 	switch parts[1] {
 	case "join":
 		s.handleJoin(w, r, code)
@@ -186,6 +214,16 @@ func (s *Server) handleSessionRoutes(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionCards(w, r, code)
 	case "summary":
 		s.handleSummary(w, r, code)
+	case "transcript":
+		s.handleTranscript(w, r, code)
+	case "transcript-partial":
+		s.handleParticipantTranscriptPartial(w, r, code)
+	case "transcript-consent":
+		s.handleTranscriptConsent(w, r, code)
+	case "analysis-jobs":
+		s.handleAnalysisJobs(w, r, code)
+	case "insights":
+		s.handleInsights(w, r, code)
 	case "audit":
 		s.handleAudit(w, r, code)
 	case "events":
@@ -467,6 +505,7 @@ func (s *Server) handleVideoToken(w http.ResponseWriter, r *http.Request, code s
 	}
 
 	isFacilitator := hasFacilitatorAccess(r, session)
+	identity := fmt.Sprintf("facilitator-%d", session.ID)
 	if isFacilitator {
 	} else {
 		participantToken := participantTokenFromRequest(r)
@@ -479,23 +518,48 @@ func (s *Server) handleVideoToken(w http.ResponseWriter, r *http.Request, code s
 			writeError(w, r, http.StatusUnauthorized, "invalid participant token")
 			return
 		}
+		identity = fmt.Sprintf("participant-%d", participant.ID)
 	}
 
 	audioMode := normalizeAudioMode(in.AudioMode)
-	token, err := s.issueVideoToken(session.VideoRoom, displayName, displayName, isFacilitator, audioMode)
+	canPublishPublic := isFacilitator || s.mediaTopology != "dual"
+	publicSources := []string(nil)
+	if s.mediaTopology == "dual" && !isFacilitator {
+		publicSources = []string{"camera"}
+		if audioMode == "normal" {
+			publicSources = append(publicSources, "microphone")
+		}
+	}
+	token, err := s.issueVideoToken(session.VideoRoom, identity, displayName, isFacilitator, audioMode, canPublishPublic, publicSources, true)
 	if err != nil {
 		log.Printf("issue livekit token: %v", err)
 		writeError(w, r, http.StatusInternalServerError, "failed to create video token")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"room":         session.VideoRoom,
-		"server_url":   s.livekitURL,
-		"token":        token,
-		"display_name": displayName,
-		"audio_mode":   audioMode,
-		"is_moderator": isFacilitator,
-	})
+	if _, err := s.store.MarkMediaStarted(r.Context(), code); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to start media session")
+		return
+	}
+	response := map[string]interface{}{
+		"room":           session.VideoRoom,
+		"server_url":     s.livekitURL,
+		"token":          token,
+		"display_name":   displayName,
+		"audio_mode":     audioMode,
+		"is_moderator":   isFacilitator,
+		"media_topology": s.mediaTopology,
+	}
+	if s.mediaTopology == "dual" && !isFacilitator {
+		inputRoom := buildInputRoomName(code)
+		inputToken, tokenErr := s.issueVideoToken(inputRoom, identity, displayName, false, audioMode, true, []string{"microphone"}, false)
+		if tokenErr != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to create input video token")
+			return
+		}
+		response["input_room"] = inputRoom
+		response["input_token"] = inputToken
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleVoiceTemplates(w http.ResponseWriter, r *http.Request) {
@@ -541,6 +605,7 @@ func (s *Server) handleAnonymousAudioSettings(w http.ResponseWriter, r *http.Req
 	}
 	var in struct {
 		Enabled             bool   `json:"enabled"`
+		AudioMode           string `json:"audio_mode"`
 		LanguageMode        string `json:"language_mode"`
 		PreferredLanguage   string `json:"preferred_language"`
 		VoiceTemplateID     string `json:"voice_template_id"`
@@ -550,13 +615,20 @@ func (s *Server) handleAnonymousAudioSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, r, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if in.Enabled && !s.anonymousAudioWorkerReady(r.Context()) {
+	audioMode := normalizeAudioMode(in.AudioMode)
+	if !in.Enabled {
+		audioMode = "normal"
+	}
+	// Synthetic mode is served by anonymous-audio-worker. Masked mode is
+	// handled by the dual-room media-worker and must remain usable even when
+	// the legacy synthetic worker is intentionally disabled.
+	if requiresAnonymousAudioWorker(in.Enabled, audioMode) && !s.anonymousAudioWorkerReady(r.Context()) {
 		writeError(w, r, http.StatusServiceUnavailable, "anonymous audio worker unavailable")
 		return
 	}
 	settings, err := s.store.UpsertAnonymousAudioSettings(r.Context(), roomID, participantToken, model.AnonymousAudioSettings{
 		Enabled:             in.Enabled,
-		AudioMode:           map[bool]string{true: "anonymous", false: "normal"}[in.Enabled],
+		AudioMode:           audioMode,
 		LanguageMode:        normalizeLanguageMode(in.LanguageMode),
 		PreferredLanguage:   normalizePreferredLanguage(in.PreferredLanguage),
 		VoiceTemplateID:     normalizeVoiceTemplateID(in.VoiceTemplateID),
@@ -600,6 +672,10 @@ func (s *Server) handleAnonymousAudioWorkItems(w http.ResponseWriter, r *http.Re
 		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
 	items, err := s.store.ListAnonymousAudioWorkItems(r.Context())
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "failed to load anonymous audio work items")
@@ -611,6 +687,10 @@ func (s *Server) handleAnonymousAudioWorkItems(w http.ResponseWriter, r *http.Re
 func (s *Server) handleAnonymousAudioRuntime(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
 		return
 	}
 	var in model.AnonymousAudioRuntimeUpdate
@@ -754,6 +834,751 @@ func (s *Server) handleCardPatch(w http.ResponseWriter, r *http.Request, cardID 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"card": updated})
 }
 
+func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, code string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleTranscriptList(w, r, code)
+	case http.MethodPost:
+		s.handleParticipantTranscriptSegment(w, r, code)
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleTranscriptExport produces a facilitator-only, derived copy of the
+// finalized transcript. It intentionally never contains participant tokens or
+// raw-media references.
+func (s *Server) handleTranscriptExport(w http.ResponseWriter, r *http.Request, code string) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	var in struct {
+		Format string `json:"format"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(in.Format))
+	if format == "" {
+		format = "markdown"
+	}
+	if format != "markdown" && format != "json" {
+		writeError(w, r, http.StatusBadRequest, "invalid export format")
+		return
+	}
+	segments, err := s.store.ListTranscriptSegments(r.Context(), code, 0, 5000)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load transcript")
+		return
+	}
+	filename := "ghosttalk-transcript-" + strings.ToLower(session.Code)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename+map[string]string{"markdown": ".md", "json": ".json"}[format]))
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writeJSON(w, http.StatusOK, map[string]interface{}{"session": s.exposeSession(session), "segments": segments})
+		return
+	}
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	var out strings.Builder
+	fmt.Fprintf(&out, "# %s — протокол зустрічі\n\n", session.Title)
+	fmt.Fprintf(&out, "Код сесії: `%s`\n\n", session.Code)
+	for _, segment := range segments {
+		minutes := segment.StartedAtMs / 60000
+		seconds := (segment.StartedAtMs % 60000) / 1000
+		fmt.Fprintf(&out, "- **[%02d:%02d] %s:** %s\n", minutes, seconds, segment.ParticipantAlias, segment.Text)
+	}
+	_, _ = io.WriteString(w, out.String())
+}
+
+func (s *Server) handleTranscriptList(w http.ResponseWriter, r *http.Request, code string) {
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	fromMs, err := nonNegativeQueryInt64(r, "from_ms")
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid transcript cursor")
+		return
+	}
+	limit := 200
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		value, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || value < 1 || value > 500 {
+			writeError(w, r, http.StatusBadRequest, "invalid transcript limit")
+			return
+		}
+		limit = value
+	}
+	segments, err := s.store.ListTranscriptSegments(r.Context(), code, fromMs, limit)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load transcript")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"segments": segments, "session": s.exposeSession(session)})
+}
+
+func (s *Server) handleParticipantTranscriptSegment(w http.ResponseWriter, r *http.Request, code string) {
+	if !s.allowRequest(r, "create_transcript_segment", 120, time.Minute) {
+		writeError(w, r, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	participantToken := participantTokenFromRequest(r)
+	if participantToken == "" {
+		writeError(w, r, http.StatusUnauthorized, "missing participant token")
+		return
+	}
+	var in struct {
+		SegmentKey  string  `json:"segment_key"`
+		TrackSID    string  `json:"track_sid"`
+		StartedAtMs int64   `json:"started_at_ms"`
+		EndedAtMs   int64   `json:"ended_at_ms"`
+		Text        string  `json:"text"`
+		Language    string  `json:"language"`
+		Confidence  float64 `json:"confidence"`
+		Redacted    bool    `json:"redacted"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	segment, err := s.createTranscriptSegment(r.Context(), code, participantToken, in.SegmentKey, in.TrackSID, in.StartedAtMs, in.EndedAtMs, in.Text, in.Language, in.Confidence, in.Redacted)
+	if errors.Is(err, store.ErrTranscriptConsentRequired) {
+		writeError(w, r, http.StatusForbidden, "transcript consent required")
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusUnauthorized, "invalid participant token")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid transcript segment")
+		return
+	}
+	s.publishTranscriptFinal(code, segment)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"segment": segment})
+}
+
+func (s *Server) handleTranscriptConsent(w http.ResponseWriter, r *http.Request, code string) {
+	participantToken := participantTokenFromRequest(r)
+	if participantToken == "" {
+		writeError(w, r, http.StatusUnauthorized, "missing participant token")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		consented, err := s.store.HasTranscriptConsent(r.Context(), code, participantToken)
+		if err != nil {
+			writeError(w, r, http.StatusUnauthorized, "invalid participant token")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"consented": consented})
+	case http.MethodPut:
+		var in struct {
+			Consented bool `json:"consented"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		consented, err := s.store.SetTranscriptConsent(r.Context(), code, participantToken, in.Consented)
+		if err != nil {
+			writeError(w, r, http.StatusUnauthorized, "invalid participant token")
+			return
+		}
+		session, _ := s.store.GetSessionByCode(r.Context(), code)
+		s.auditRequest(r, session.ID, "transcript_consent_updated", "participant", participantToken, map[string]interface{}{"consented": consented})
+		writeJSON(w, http.StatusOK, map[string]bool{"consented": consented})
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleParticipantTranscriptPartial delivers an ephemeral caption. It is
+// consent-gated and intentionally performs no database write: browser STT may
+// revise interim text many times before a final segment exists.
+func (s *Server) handleParticipantTranscriptPartial(w http.ResponseWriter, r *http.Request, code string) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.allowRequest(r, "transcript_partial", 120, time.Minute) {
+		writeError(w, r, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	participantToken := participantTokenFromRequest(r)
+	if participantToken == "" {
+		writeError(w, r, http.StatusUnauthorized, "missing participant token")
+		return
+	}
+	var in struct {
+		Text     string `json:"text"`
+		Language string `json:"language"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Text = strings.TrimSpace(in.Text)
+	if in.Text == "" || len(in.Text) > 2000 {
+		writeError(w, r, http.StatusBadRequest, "invalid transcript segment")
+		return
+	}
+	participantID, alias, err := s.store.ConsentedTranscriptParticipant(r.Context(), code, participantToken)
+	if errors.Is(err, store.ErrTranscriptConsentRequired) {
+		writeError(w, r, http.StatusForbidden, "transcript consent required")
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusUnauthorized, "invalid participant token")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to create caption")
+		return
+	}
+	in.Text, _ = redactTranscriptPII(in.Text)
+	s.publishTranscriptPartial(code, participantID, alias, in.Text, truncateString(in.Language, 20))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAnalysisJobs(w http.ResponseWriter, r *http.Request, code string) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	if !s.analysisWorkerReady(r.Context()) {
+		writeError(w, r, http.StatusServiceUnavailable, "analysis worker unavailable")
+		return
+	}
+	job, err := s.store.CreateAnalysisJob(r.Context(), code, "facilitator")
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to queue analysis")
+		return
+	}
+	s.auditRequest(r, session.ID, "analysis_queued", "facilitator", facilitatorTokenFromRequest(r), map[string]interface{}{"job_id": job.ID})
+	s.publish(code, "analysis.started", map[string]interface{}{"job_id": job.ID, "status": job.Status})
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{"job": job})
+}
+
+func (s *Server) handleInsights(w http.ResponseWriter, r *http.Request, code string) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	insight, err := s.store.GetSessionInsight(r.Context(), code)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"insight": nil, "session": s.exposeSession(session)})
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load insights")
+		return
+	}
+	actionItems, err := s.store.ListActionItems(r.Context(), code)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load action items")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"insight": insight, "action_items": actionItems, "session": s.exposeSession(session)})
+}
+
+func (s *Server) handleInternalTranscriptSegments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
+	var in struct {
+		SessionCode      string  `json:"session_code"`
+		ParticipantToken string  `json:"participant_token"`
+		SegmentKey       string  `json:"segment_key"`
+		TrackSID         string  `json:"track_sid"`
+		StartedAtMs      int64   `json:"started_at_ms"`
+		EndedAtMs        int64   `json:"ended_at_ms"`
+		Text             string  `json:"text"`
+		Language         string  `json:"language"`
+		Confidence       float64 `json:"confidence"`
+		Redacted         bool    `json:"redacted"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.SessionCode = strings.ToUpper(strings.TrimSpace(in.SessionCode))
+	in.ParticipantToken = strings.TrimSpace(in.ParticipantToken)
+	segment, err := s.createTranscriptSegment(r.Context(), in.SessionCode, in.ParticipantToken, in.SegmentKey, in.TrackSID, in.StartedAtMs, in.EndedAtMs, in.Text, in.Language, in.Confidence, in.Redacted)
+	if errors.Is(err, store.ErrTranscriptConsentRequired) {
+		writeError(w, r, http.StatusForbidden, "transcript consent required")
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusNotFound, "participant or session not found")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to save transcript segment")
+		return
+	}
+	s.publishTranscriptFinal(in.SessionCode, segment)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"segment": segment})
+}
+
+func (s *Server) handleTranscriptWorkItems(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
+	items, err := s.store.ListTranscriptWorkItems(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load transcript work items")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": items})
+}
+
+func (s *Server) handleInternalAnalysisRoutes(w http.ResponseWriter, r *http.Request) {
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/internal/analysis/"), "/")
+	if path == "jobs/claim" && r.Method == http.MethodPost {
+		job, err := s.store.ClaimNextAnalysisJob(r.Context())
+		if errors.Is(err, store.ErrNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to claim analysis job")
+			return
+		}
+		code, err := s.store.GetSessionCodeByAnalysisJobID(r.Context(), job.ID)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to load analysis job")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"job": job, "session_code": code})
+		return
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 3 || parts[0] != "jobs" {
+		writeError(w, r, http.StatusNotFound, "not found")
+		return
+	}
+	jobID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || jobID <= 0 {
+		writeError(w, r, http.StatusBadRequest, "invalid job id")
+		return
+	}
+	code, err := s.store.GetSessionCodeByAnalysisJobID(r.Context(), jobID)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "analysis job not found")
+		return
+	}
+	switch parts[2] {
+	case "input":
+		if r.Method != http.MethodGet {
+			writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		segments, err := s.store.ListTranscriptSegments(r.Context(), code, 0, 5000)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to load transcript")
+			return
+		}
+		cards, err := s.store.ListCards(r.Context(), code, true)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to load cards")
+			return
+		}
+		for index := range cards {
+			cards[index].Text, _ = redactTranscriptPII(cards[index].Text)
+		}
+		session, err := s.store.GetSessionByCode(r.Context(), code)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to load session")
+			return
+		}
+		// Session metadata is not normally part of a transcript, but titles and
+		// descriptions are user-entered and can contain the same obvious PII.
+		// Redact it before it crosses the worker/LLM boundary as well.
+		safeSession := s.exposeSession(session)
+		safeSession["title"], _ = redactTranscriptPII(session.Title)
+		safeSession["description"], _ = redactTranscriptPII(session.Description)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"session": safeSession, "segments": segments, "cards": cards})
+	case "complete":
+		if r.Method != http.MethodPost {
+			writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var in struct {
+			Insight     model.SessionInsight `json:"insight"`
+			ActionItems []model.ActionItem   `json:"action_items"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		in.Insight.ExecutiveSummary = strings.TrimSpace(in.Insight.ExecutiveSummary)
+		in.Insight.ExecutiveSummary, _ = redactTranscriptPII(in.Insight.ExecutiveSummary)
+		var redactErr error
+		if in.Insight.Themes, redactErr = redactJSONStrings(in.Insight.Themes); redactErr != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis themes")
+			return
+		}
+		if in.Insight.Decisions, redactErr = redactJSONStrings(in.Insight.Decisions); redactErr != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis decisions")
+			return
+		}
+		if in.Insight.RisksQuestions, redactErr = redactJSONStrings(in.Insight.RisksQuestions); redactErr != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis risks")
+			return
+		}
+		if in.Insight.ExecutiveSummary == "" || len(in.Insight.ExecutiveSummary) > 20000 || len(in.ActionItems) > 100 {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis result")
+			return
+		}
+		segments, err := s.store.ListTranscriptSegments(r.Context(), code, 0, 5000)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "failed to load transcript")
+			return
+		}
+		validSegmentIDs := make(map[int64]struct{}, len(segments))
+		for _, segment := range segments {
+			validSegmentIDs[segment.ID] = struct{}{}
+		}
+		if err := validateInsightItems(in.Insight.Themes, true, validSegmentIDs); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis themes")
+			return
+		}
+		if err := validateInsightItems(in.Insight.Decisions, false, validSegmentIDs); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis decisions")
+			return
+		}
+		if err := validateInsightItems(in.Insight.RisksQuestions, false, validSegmentIDs); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid analysis risks")
+			return
+		}
+		for index := range in.ActionItems {
+			in.ActionItems[index].Text = strings.TrimSpace(in.ActionItems[index].Text)
+			in.ActionItems[index].Text, _ = redactTranscriptPII(in.ActionItems[index].Text)
+			in.ActionItems[index].OwnerAlias = truncateString(strings.TrimSpace(in.ActionItems[index].OwnerAlias), 80)
+			in.ActionItems[index].OwnerAlias, _ = redactTranscriptPII(in.ActionItems[index].OwnerAlias)
+			if in.ActionItems[index].Text == "" || len(in.ActionItems[index].Text) > 2000 || !validSegmentIDList(in.ActionItems[index].SourceSegmentIDs, validSegmentIDs) {
+				writeError(w, r, http.StatusBadRequest, "invalid action item")
+				return
+			}
+			if in.ActionItems[index].Status == "" {
+				in.ActionItems[index].Status = "open"
+			}
+			if in.ActionItems[index].Status != "open" && in.ActionItems[index].Status != "in_progress" && in.ActionItems[index].Status != "done" {
+				writeError(w, r, http.StatusBadRequest, "invalid action item")
+				return
+			}
+		}
+		if err := s.store.CompleteAnalysisJob(r.Context(), jobID, in.Insight, in.ActionItems); err != nil {
+			writeError(w, r, http.StatusConflict, "failed to complete analysis job")
+			return
+		}
+		s.publish(code, "analysis.completed", map[string]interface{}{"job_id": jobID})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "completed"})
+	case "fail":
+		if r.Method != http.MethodPost {
+			writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var in struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		if err := s.store.FailAnalysisJob(r.Context(), jobID, in.Error); err != nil {
+			writeError(w, r, http.StatusConflict, "failed to fail analysis job")
+			return
+		}
+		s.publish(code, "analysis.failed", map[string]interface{}{"job_id": jobID})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "failed"})
+	default:
+		writeError(w, r, http.StatusNotFound, "not found")
+	}
+}
+
+// validateInsightItems accepts the structured analysis fields, checks their
+// short human-readable content, and rejects citations outside this session.
+func validateInsightItems(raw json.RawMessage, isTheme bool, validIDs map[int64]struct{}) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || len(items) > 100 {
+		return errors.New("invalid insight array")
+	}
+	for _, item := range items {
+		var primary string
+		if isTheme {
+			var title string
+			if err := json.Unmarshal(item["title"], &title); err != nil || strings.TrimSpace(title) == "" || len(title) > 500 {
+				return errors.New("invalid theme title")
+			}
+			if err := json.Unmarshal(item["summary"], &primary); err != nil {
+				return errors.New("invalid theme summary")
+			}
+		} else if err := json.Unmarshal(item["text"], &primary); err != nil {
+			return errors.New("invalid insight text")
+		}
+		if primary = strings.TrimSpace(primary); primary == "" || len(primary) > 4000 || !validSegmentIDList(item["segment_ids"], validIDs) {
+			return errors.New("invalid insight item")
+		}
+	}
+	return nil
+}
+
+func validSegmentIDList(raw json.RawMessage, validIDs map[int64]struct{}) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var ids []int64
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return false
+	}
+	if len(ids) == 0 {
+		return false
+	}
+	for _, id := range ids {
+		if _, ok := validIDs[id]; !ok || id <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func redactJSONStrings(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage("[]"), nil
+	}
+	var value interface{}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, err
+	}
+	value = redactJSONValue(value)
+	encoded, err := json.Marshal(value)
+	return json.RawMessage(encoded), err
+}
+
+func redactJSONValue(value interface{}) interface{} {
+	switch current := value.(type) {
+	case string:
+		redacted, _ := redactTranscriptPII(current)
+		return redacted
+	case []interface{}:
+		for index := range current {
+			current[index] = redactJSONValue(current[index])
+		}
+	case map[string]interface{}:
+		for key := range current {
+			current[key] = redactJSONValue(current[key])
+		}
+	}
+	return value
+}
+
+func (s *Server) createTranscriptSegment(ctx context.Context, sessionCode, participantToken, segmentKey, trackSID string, startedAtMs, endedAtMs int64, text, language string, confidence float64, redacted bool) (model.TranscriptSegment, error) {
+	text = strings.TrimSpace(text)
+	segmentKey = truncateString(strings.TrimSpace(segmentKey), 80)
+	if sessionCode == "" || participantToken == "" || text == "" || len(text) > 8000 || startedAtMs < 0 || endedAtMs < startedAtMs || confidence < 0 || confidence > 1 {
+		return model.TranscriptSegment{}, errors.New("invalid transcript segment")
+	}
+	text, piiRedacted := redactTranscriptPII(text)
+	return s.store.CreateTranscriptSegment(ctx, sessionCode, participantToken, model.TranscriptSegment{
+		SegmentKey: segmentKey, TrackSID: truncateString(trackSID, 128), StartedAtMs: startedAtMs, EndedAtMs: endedAtMs,
+		Text: text, Language: truncateString(language, 20), Confidence: confidence, IsFinal: true, Redacted: redacted || piiRedacted,
+	})
+}
+
+// redactTranscriptPII intentionally runs before persistence, including for
+// browser-originated fallback transcription. It is a conservative baseline;
+// deployments with stricter requirements can add domain-specific redactors in
+// the media worker before it calls the same endpoint.
+func redactTranscriptPII(text string) (string, bool) {
+	redacted := transcriptEmailPattern.ReplaceAllString(text, "[redacted-email]")
+	redacted = transcriptPhonePattern.ReplaceAllString(redacted, "[redacted-phone]")
+	return redacted, redacted != text
+}
+
+func (s *Server) handleActionItemRoutes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id, err := strconv.ParseInt(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/action-items/"), "/"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, r, http.StatusBadRequest, "invalid action item id")
+		return
+	}
+	item, err := s.store.GetActionItem(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusNotFound, "action item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load action item")
+		return
+	}
+	code, err := s.store.GetSessionCodeByID(r.Context(), item.SessionID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "session not found")
+		return
+	}
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil || !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	var in struct {
+		Text       string `json:"text"`
+		OwnerAlias string `json:"owner_alias"`
+		Status     string `json:"status"`
+		DueDate    string `json:"due_date"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	in.Text = strings.TrimSpace(in.Text)
+	in.Text, _ = redactTranscriptPII(in.Text)
+	in.OwnerAlias = truncateString(strings.TrimSpace(in.OwnerAlias), 80)
+	in.OwnerAlias, _ = redactTranscriptPII(in.OwnerAlias)
+	in.Status = strings.ToLower(strings.TrimSpace(in.Status))
+	if in.Text == "" || len(in.Text) > 2000 || (in.Status != "open" && in.Status != "in_progress" && in.Status != "done") {
+		writeError(w, r, http.StatusBadRequest, "invalid action item")
+		return
+	}
+	var dueDate *time.Time
+	if raw := strings.TrimSpace(in.DueDate); raw != "" {
+		parsed, parseErr := time.Parse("2006-01-02", raw)
+		if parseErr != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid due date")
+			return
+		}
+		dueDate = &parsed
+	}
+	updated, err := s.store.UpdateActionItem(r.Context(), id, in.Text, in.OwnerAlias, in.Status, dueDate)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to update action item")
+		return
+	}
+	s.auditRequest(r, session.ID, "action_item_updated", "facilitator", facilitatorTokenFromRequest(r), map[string]interface{}{"action_item_id": id, "status": updated.Status})
+	s.publish(code, "action_item_updated", updated)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"action_item": updated})
+}
+
+func (s *Server) handleTranscriptSegmentRoutes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id, err := strconv.ParseInt(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/transcript-segments/"), "/"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, r, http.StatusBadRequest, "invalid transcript segment id")
+		return
+	}
+	segment, err := s.store.GetTranscriptSegment(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, r, http.StatusNotFound, "transcript segment not found")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to load transcript segment")
+		return
+	}
+	code, err := s.store.GetSessionCodeByID(r.Context(), segment.SessionID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "session not found")
+		return
+	}
+	session, err := s.store.GetSessionByCode(r.Context(), code)
+	if err != nil || !hasFacilitatorAccess(r, session) {
+		writeError(w, r, http.StatusUnauthorized, "invalid facilitator token")
+		return
+	}
+	var in struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	text := strings.TrimSpace(in.Text)
+	if text == "" || len(text) > 8000 {
+		writeError(w, r, http.StatusBadRequest, "invalid transcript segment")
+		return
+	}
+	text, redacted := redactTranscriptPII(text)
+	updated, err := s.store.UpdateTranscriptSegment(r.Context(), id, text, segment.Redacted || redacted)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "failed to update transcript segment")
+		return
+	}
+	s.auditRequest(r, session.ID, "transcript_segment_updated", "facilitator", facilitatorTokenFromRequest(r), map[string]interface{}{
+		"segment_id": id, "text_size": len(updated.Text), "redacted": updated.Redacted,
+	})
+	s.publishTranscriptFinal(code, updated)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"segment": updated})
+}
+
+func nonNegativeQueryInt64(r *http.Request, key string) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, errors.New("invalid query integer")
+	}
+	return value, nil
+}
+
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request, code string) {
 	session, err := s.store.GetSessionByCode(r.Context(), code)
 	if err != nil {
@@ -875,10 +1700,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, code strin
 		writeError(w, r, http.StatusTooManyRequests, "too many requests")
 		return
 	}
-	_, err := s.store.GetSessionByCode(r.Context(), code)
+	session, err := s.store.GetSessionByCode(r.Context(), code)
 	if err != nil {
 		writeError(w, r, http.StatusNotFound, "session not found")
 		return
+	}
+	isFacilitator := hasFacilitatorAccess(r, session)
+	var participantID int64
+	if !isFacilitator {
+		participantToken := participantTokenFromRequest(r)
+		participant, participantErr := s.store.FindParticipantByToken(r.Context(), participantToken)
+		if participantErr != nil || participant.SessionID != session.ID {
+			writeError(w, r, http.StatusUnauthorized, "session access required")
+			return
+		}
+		participantID = participant.ID
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -890,7 +1726,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, code strin
 	w.Header().Set("Connection", "keep-alive")
 
 	ctx := r.Context()
-	client := s.hub.Subscribe(code)
+	client := s.hub.Subscribe(code, isFacilitator, participantID)
 	defer s.hub.Unsubscribe(code, client)
 
 	ticker := time.NewTicker(20 * time.Second)
@@ -974,8 +1810,7 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		log.Printf("whisper request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		log.Printf("whisper request returned HTTP %d", resp.StatusCode)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			writeError(w, r, http.StatusUnprocessableEntity, "unsupported audio format")
 			return
@@ -993,6 +1828,25 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"text": strings.TrimSpace(result.Text)})
+}
+
+// handleInternalTranscribe keeps worker-originated raw audio off the public
+// route. It reuses the same STT implementation, but requires the service
+// token and is blocked by every public Nginx configuration.
+func (s *Server) handleInternalTranscribe(w http.ResponseWriter, r *http.Request) {
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
+	s.handleTranscribe(w, r)
+}
+
+func (s *Server) handleInternalSynthesize(w http.ResponseWriter, r *http.Request) {
+	if !s.hasInternalWorkerAccess(r) {
+		writeError(w, r, http.StatusUnauthorized, "invalid worker token")
+		return
+	}
+	s.handleSynthesize(w, r)
 }
 
 func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
@@ -1044,8 +1898,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		log.Printf("tts request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		log.Printf("tts request returned HTTP %d", resp.StatusCode)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			writeError(w, r, http.StatusUnprocessableEntity, "unsupported voice or text")
 			return
@@ -1065,7 +1918,31 @@ func (s *Server) publish(code, eventType string, payload interface{}) {
 	if err != nil {
 		return
 	}
-	s.hub.Broadcast(code, data)
+	s.hub.Broadcast(code, eventType, data)
+}
+
+// publishTranscriptFinal keeps finalized transcript text private while still
+// allowing the consenting speaker to see their own caption. Facilitators keep
+// their existing full-transcript stream; other participants receive nothing.
+func (s *Server) publishTranscriptFinal(code string, segment model.TranscriptSegment) {
+	data, err := json.Marshal(model.Event{Type: "transcript.segment.final", Payload: segment})
+	if err != nil {
+		return
+	}
+	s.hub.BroadcastToParticipant(code, segment.ParticipantID, data)
+}
+
+func (s *Server) publishTranscriptPartial(code string, participantID int64, alias, text, language string) {
+	data, err := json.Marshal(model.Event{Type: "transcript.segment.partial", Payload: map[string]interface{}{
+		"participant_alias": alias,
+		"text":              text,
+		"language":          language,
+		"is_final":          false,
+	}})
+	if err != nil {
+		return
+	}
+	s.hub.BroadcastToParticipant(code, participantID, data)
 }
 
 func (s *Server) publishAnonymousAudioEvent(code string, settings model.AnonymousAudioSettings, voiceTemplate model.VoiceTemplate) {
@@ -1350,6 +2227,7 @@ func (s *Server) exposeSession(session model.Session) map[string]interface{} {
 		"video_enabled":             s.videoEnabled(),
 		"anonymous_audio_available": s.anonymousAudioWorkerURL != "",
 		"video_server_url":          s.livekitURL,
+		"media_topology":            s.mediaTopology,
 		"voting_open":               session.VotingOpen,
 		"ended_at":                  session.EndedAt,
 		"created_at":                session.CreatedAt,
@@ -1358,6 +2236,17 @@ func (s *Server) exposeSession(session model.Session) map[string]interface{} {
 
 func buildVideoRoomName(code string) string {
 	return fmt.Sprintf("ghosttalk-%s", strings.ToLower(strings.TrimSpace(code)))
+}
+
+func buildInputRoomName(code string) string {
+	return fmt.Sprintf("ghosttalk-%s-input", strings.ToLower(strings.TrimSpace(code)))
+}
+
+func normalizeMediaTopology(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), "dual") {
+		return "dual"
+	}
+	return "single"
 }
 
 func (s *Server) videoEnabled() bool {
@@ -1380,7 +2269,7 @@ func isConfiguredLiveKitValue(v string) bool {
 	return true
 }
 
-func (s *Server) issueVideoToken(room, identity, displayName string, moderator bool, audioMode string) (string, error) {
+func (s *Server) issueVideoToken(room, identity, displayName string, moderator bool, audioMode string, canPublish bool, publishSources []string, canSubscribe bool) (string, error) {
 	now := time.Now()
 	metadata := map[string]interface{}{
 		"display_name": displayName,
@@ -1398,9 +2287,10 @@ func (s *Server) issueVideoToken(room, identity, displayName string, moderator b
 			Room:                 room,
 			RoomJoin:             true,
 			RoomAdmin:            moderator,
-			CanPublish:           true,
+			CanPublish:           canPublish,
+			CanPublishSources:    publishSources,
 			CanPublishData:       true,
-			CanSubscribe:         true,
+			CanSubscribe:         canSubscribe,
 			CanUpdateOwnMetadata: true,
 		},
 		Metadata: string(metadataJSON),
@@ -1410,10 +2300,18 @@ func (s *Server) issueVideoToken(room, identity, displayName string, moderator b
 }
 
 func normalizeAudioMode(v string) string {
-	if strings.EqualFold(strings.TrimSpace(v), "anonymous") {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "masked":
+		return "masked"
+	case "anonymous", "synthetic":
 		return "anonymous"
+	default:
+		return "normal"
 	}
-	return "normal"
+}
+
+func requiresAnonymousAudioWorker(enabled bool, audioMode string) bool {
+	return enabled && normalizeAudioMode(audioMode) == "anonymous"
 }
 
 func normalizeLanguageMode(v string) string {
@@ -1468,6 +2366,46 @@ func (s *Server) anonymousAudioWorkerReady(ctx context.Context) bool {
 	return out.Status == "ready" && out.Livekit && out.Redis && out.SttModel && out.TtsEngine
 }
 
+func (s *Server) analysisWorkerReady(ctx context.Context) bool {
+	if s.analysisWorkerURL == "" {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.analysisWorkerURL+"/ready", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return false
+	}
+	var out struct {
+		Status     string `json:"status"`
+		Configured bool   `json:"configured"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false
+	}
+	return out.Status == "ready" && out.Configured
+}
+
+// hasInternalWorkerAccess protects endpoints that exchange participant-scoped
+// data with trusted workers. Constant-time comparison avoids making the shared
+// secret observable through a comparison timing difference.
+func (s *Server) hasInternalWorkerAccess(r *http.Request) bool {
+	if r == nil || s.internalWorkerToken == "" {
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-Internal-Worker-Token"))
+	if len(provided) != len(s.internalWorkerToken) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.internalWorkerToken)) == 1
+}
+
 func (s *Server) exposeAnonymousAudioStatus(settings model.AnonymousAudioSettings, voiceTemplate model.VoiceTemplate) map[string]interface{} {
 	return map[string]interface{}{
 		"enabled":             settings.Enabled,
@@ -1508,13 +2446,14 @@ type livekitTokenClaims struct {
 }
 
 type livekitVideoGrant struct {
-	Room                 string `json:"room,omitempty"`
-	RoomJoin             bool   `json:"roomJoin,omitempty"`
-	RoomAdmin            bool   `json:"roomAdmin,omitempty"`
-	CanPublish           bool   `json:"canPublish,omitempty"`
-	CanPublishData       bool   `json:"canPublishData,omitempty"`
-	CanSubscribe         bool   `json:"canSubscribe,omitempty"`
-	CanUpdateOwnMetadata bool   `json:"canUpdateOwnMetadata,omitempty"`
+	Room                 string   `json:"room,omitempty"`
+	RoomJoin             bool     `json:"roomJoin,omitempty"`
+	RoomAdmin            bool     `json:"roomAdmin,omitempty"`
+	CanPublish           bool     `json:"canPublish,omitempty"`
+	CanPublishSources    []string `json:"canPublishSources,omitempty"`
+	CanPublishData       bool     `json:"canPublishData,omitempty"`
+	CanSubscribe         bool     `json:"canSubscribe,omitempty"`
+	CanUpdateOwnMetadata bool     `json:"canUpdateOwnMetadata,omitempty"`
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -1676,6 +2615,9 @@ var errorUK = map[string]string{
 	"failed to join session":                  "не вдалося приєднатися до сесії",
 	"invalid join secret":                     "некоректний секрет входу",
 	"invalid captcha":                         "некоректна captcha",
+	"analysis worker unavailable":             "сервіс формування висновків тимчасово недоступний",
+	"transcript consent required":             "потрібна згода на транскрипцію",
+	"too many requests":                       "забагато запитів, спробуйте пізніше",
 	"session is full":                         "сесія вже заповнена",
 	"failed to list cards":                    "не вдалося отримати картки",
 	"text required (1..1000 chars)":           "текст обов'язковий (1..1000 символів)",
@@ -1707,7 +2649,6 @@ var errorUK = map[string]string{
 	"unsupported voice or text":               "непідтримуваний голос або текст",
 	"video service is not configured":         "відеосервіс не налаштований",
 	"failed to create video token":            "не вдалося створити токен відеокімнати",
-	"too many requests":                       "забагато запитів",
 }
 
 func WithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {

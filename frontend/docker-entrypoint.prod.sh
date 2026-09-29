@@ -11,7 +11,9 @@ LIVEKIT_TLS_CERT_PATH_CONTAINER="${LIVEKIT_TLS_CERT_PATH_CONTAINER:-/etc/nginx/t
 LIVEKIT_TLS_KEY_PATH_CONTAINER="${LIVEKIT_TLS_KEY_PATH_CONTAINER:-/etc/nginx/tls/livekit/privkey.pem}"
 BACKEND_HOST="${BACKEND_HOST:-backend}"
 LIVEKIT_UPSTREAM="${LIVEKIT_UPSTREAM:-http://livekit:7880}"
-CSP_CONNECT_SRC="${CSP_CONNECT_SRC:-'self' https: wss:}"
+# Fail closed by default. Production deployments must explicitly list the
+# application and LiveKit origins required by the browser.
+CSP_CONNECT_SRC="${CSP_CONNECT_SRC:-'self'}"
 
 if [ ! -f "$LIVEKIT_TLS_CERT_PATH_CONTAINER" ] || [ ! -f "$LIVEKIT_TLS_KEY_PATH_CONTAINER" ]; then
   LIVEKIT_TLS_CERT_PATH_CONTAINER="$TLS_CERT_PATH_CONTAINER"

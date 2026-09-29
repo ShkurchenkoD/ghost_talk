@@ -112,6 +112,84 @@ export const getAuditEvents = (code, params = {}) => {
   return request(`/api/sessions/${code}/audit${suffix}`);
 };
 
+export const getTranscript = (code, params = {}, facilitatorToken = "") => {
+  const search = new URLSearchParams();
+  if (params.fromMs) search.set("from_ms", String(params.fromMs));
+  if (params.limit) search.set("limit", String(params.limit));
+  const suffix = search.size ? `?${search.toString()}` : "";
+  return request(`/api/sessions/${code}/transcript${suffix}`, {
+    headers: facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {},
+  });
+};
+
+export const createTranscriptSegment = (code, payload, participantToken) =>
+  request(`/api/sessions/${code}/transcript`, {
+    method: "POST",
+    headers: { "X-Participant-Token": participantToken },
+    body: JSON.stringify(payload),
+  });
+
+export const createTranscriptPartial = (code, payload, participantToken) =>
+  request(`/api/sessions/${code}/transcript-partial`, {
+    method: "POST",
+    headers: { "X-Participant-Token": participantToken },
+    body: JSON.stringify(payload),
+  });
+
+export const updateTranscriptSegment = (id, text, facilitatorToken = "") =>
+  request(`/api/transcript-segments/${id}`, {
+    method: "PATCH",
+    headers: facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {},
+    body: JSON.stringify({ text }),
+  });
+
+export async function exportTranscript(code, format = "markdown", facilitatorToken = "") {
+  const res = await fetch(`${API_BASE}/api/sessions/${code}/transcript/export`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept-Language": currentLang(),
+      ...(facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {}),
+    },
+    body: JSON.stringify({ format }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return res.blob();
+}
+
+export const getTranscriptConsent = (code, participantToken) =>
+  request(`/api/sessions/${code}/transcript-consent`, { headers: { "X-Participant-Token": participantToken } });
+
+export const setTranscriptConsent = (code, consented, participantToken) =>
+  request(`/api/sessions/${code}/transcript-consent`, {
+    method: "PUT",
+    headers: { "X-Participant-Token": participantToken },
+    body: JSON.stringify({ consented }),
+  });
+
+export const queueSessionAnalysis = (code, facilitatorToken = "") =>
+  request(`/api/sessions/${code}/analysis-jobs`, {
+    method: "POST",
+    headers: facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {},
+    body: "{}",
+  });
+
+export const getSessionInsights = (code, facilitatorToken = "") =>
+  request(`/api/sessions/${code}/insights`, {
+    headers: facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {},
+  });
+
+export const updateActionItem = (id, payload, facilitatorToken = "") =>
+  request(`/api/action-items/${id}`, {
+    method: "PATCH",
+    headers: facilitatorToken ? { "X-Facilitator-Token": facilitatorToken } : {},
+    body: JSON.stringify(payload),
+  });
+
 export function getEventsUrl(code) {
   return `${API_BASE}/api/sessions/${code}/events`;
 }
