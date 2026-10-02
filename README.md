@@ -402,6 +402,12 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 At this point the app serves plain HTTP and exposes the ACME webroot at `/.well-known/acme-challenge/`.
 
+For the two-VM production layout, `docker-compose.prod.yml` does not start the bundled LiveKit container by default. Run the separate RTC stack from `deploy/livekit/` on the LiveKit host. The bundled LiveKit service is only for single-host deployments and requires:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile bundled-livekit up -d --build
+```
+
 ### Issue a TLS certificate
 
 Point your DNS name at the server first. For example:
@@ -433,9 +439,12 @@ HOST_FRONTEND_HTTP_PORT=80
 HOST_FRONTEND_HTTPS_PORT=443
 ENABLE_TLS=true
 SERVER_NAME=ghost-talk.online
-TLS_CERTS_DIR=/etc/letsencrypt/live/ghost-talk.online
+TLS_CERTS_DIR=/etc/letsencrypt
+TLS_CERT_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/fullchain.pem
+TLS_KEY_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/privkey.pem
 CERTBOT_WWW_PATH=./certbot-www
 LIVEKIT_URL=wss://meet.ghost-talk.online
+LIVEKIT_UPSTREAM=http://10.164.0.4:7880
 LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=replace-with-strong-secret
 EOF
@@ -505,7 +514,7 @@ Published URL:
 https://ghost-talk.online/
 ```
 
-Public DNS for this deployment should point `ghost-talk.online` at `10.110.12.212`, after which a normal Let's Encrypt certificate can be issued.
+Public DNS for this deployment should point `ghost-talk.online` at the `ghost-core` public IP, after which a normal Let's Encrypt certificate can be issued.
 
 ### Ready-made env template
 

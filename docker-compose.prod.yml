@@ -129,6 +129,7 @@ services:
 
   livekit:
     image: livekit/livekit-server:master
+    profiles: ["bundled-livekit"]
     environment:
       LIVEKIT_CONFIG: |
         port: 7880
@@ -154,7 +155,6 @@ services:
         VITE_API_BASE: ""
     depends_on:
       - backend
-      - livekit
     environment:
       ENABLE_TLS: "${ENABLE_TLS:-false}"
       SERVER_NAME: "${SERVER_NAME:-_}"
@@ -164,7 +164,7 @@ services:
       TLS_KEY_PATH_CONTAINER: "${TLS_KEY_PATH_CONTAINER:-/etc/nginx/tls/privkey.pem}"
       LIVEKIT_TLS_CERT_PATH_CONTAINER: "${LIVEKIT_TLS_CERT_PATH_CONTAINER:-/etc/nginx/tls/livekit/fullchain.pem}"
       LIVEKIT_TLS_KEY_PATH_CONTAINER: "${LIVEKIT_TLS_KEY_PATH_CONTAINER:-/etc/nginx/tls/livekit/privkey.pem}"
-      LIVEKIT_UPSTREAM: "${LIVEKIT_UPSTREAM:-http://livekit:7880}"
+      LIVEKIT_UPSTREAM: "${LIVEKIT_UPSTREAM:-http://127.0.0.1:7880}"
       CSP_CONNECT_SRC: "${CSP_CONNECT_SRC:-'self'}"
     ports:
       - "${HOST_FRONTEND_HTTP_PORT:-80}:80"

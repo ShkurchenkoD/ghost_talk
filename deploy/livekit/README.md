@@ -5,15 +5,16 @@ This directory is a minimal LiveKit deployment for a separate host such as
 
 It is intentionally small and suitable for both LAN testing and a basic public deployment:
 
-- single container
+- Caddy TLS reverse proxy for browser-facing `wss://`
+- single LiveKit container
 - host networking, which LiveKit recommends for Dockerized deployments
 - `ws://10.110.12.212:7880` for LAN testing or `wss://meet.ghost-talk.online` behind TLS
-- no TLS termination inside this stack
 - reduced UDP range for simpler firewall setup
 
 ## Files
 
 - `docker-compose.yml` - starts LiveKit with host networking
+- `Caddyfile` - terminates public HTTPS/WSS and proxies to LiveKit signaling
 - `.env.example` - variables to copy into `.env`
 
 ## First-time setup on the target host
@@ -76,18 +77,22 @@ LIVEKIT_API_SECRET=<same secret as on the LiveKit host>
 
 At minimum, allow these on the LiveKit host:
 
-- `7880/tcp` - signaling
+- `80/tcp` - ACME HTTP challenge and HTTP-to-HTTPS handling
+- `443/tcp` - HTTPS/WSS signaling through Caddy
 - `7881/tcp` - RTC over TCP fallback
 - `50000-50100/udp` - RTC media
 
-## Later move to public HTTPS/WSS
+Do not allow public access to Redis, Docker, or unrelated application ports.
+LiveKit signaling on `7880/tcp` should remain private or blocked at the GCP/host firewall.
+
+## Public HTTPS/WSS
 
 For a public hostname such as `meet.ghost-talk.online`, you should:
 
-1. terminate TLS in front of LiveKit,
+1. point DNS at the `ghost-rtc` public IP,
 2. set `LIVEKIT_URL` in GhostTalk to `wss://meet.ghost-talk.online`,
 3. set `LIVEKIT_USE_EXTERNAL_IP=true`,
-4. open and verify the same TCP/UDP paths publicly.
+4. open and verify only the TCP/UDP paths listed above.
 
 References:
 

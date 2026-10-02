@@ -1,4 +1,19 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: livekit-caddy
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - livekit
+    environment:
+      LIVEKIT_SERVER_NAME: ${LIVEKIT_SERVER_NAME}
+      LIVEKIT_PORT: ${LIVEKIT_PORT}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
   livekit:
     image: livekit/livekit-server:master
     container_name: livekit
@@ -15,3 +30,7 @@ services:
           use_external_ip: ${LIVEKIT_USE_EXTERNAL_IP}
         keys:
           ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+
+volumes:
+  caddy_data:
+  caddy_config:

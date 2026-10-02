@@ -1,0 +1,3 @@
+{$LIVEKIT_SERVER_NAME} {
+	reverse_proxy 127.0.0.1:{$LIVEKIT_PORT}
+}
