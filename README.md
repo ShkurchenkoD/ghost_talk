@@ -1,4 +1,4 @@
-# GhostTalk PoC
+# GhostTalk
 
 GhostTalk — self-hosted вебплатформа для структурованих анонімних командних
 сесій. Вона допомагає збирати чесні думки, проводити голосування в реальному
@@ -11,7 +11,7 @@ GhostTalk — self-hosted вебплатформа для структурова
 - Backend: Go (`net/http`) + SSE realtime
 - Database: PostgreSQL
 - Realtime: Server-Sent Events (`/api/sessions/:code/events`)
-- Voice input: mocked transcription prompt (no voice file storage)
+- Speech pipeline: Faster Whisper STT, worker-side transcript segments and no raw voice file storage
 - Video rooms: embedded LiveKit rooms via `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET`
 - Anonymous audio mode: backend-controlled safe mode with `mute` fallback, readiness worker, and consent-gated `media-worker` transcription
 
@@ -20,7 +20,7 @@ GhostTalk — self-hosted вебплатформа для структурова
 - Facilitator creates session with methodology
 - Join code and link generation
 - Anonymous participant join (token-based, no registration)
-- Anonymous card submission (text + mock voice input)
+- Anonymous card submission (text plus legacy browser prompt voice fallback)
 - Realtime card updates (create, vote, hide, move, session state)
 - Voting with duplicate-vote prevention per participant token
 - Facilitator controls:
@@ -264,23 +264,308 @@ credentials; use it only for local development, not on a public network.
 
 ## Deploy To Remote Server
 
-Production deploy uses `docker-compose.prod.yml`.
-This production compose file does two things:
+Production deploy uses `docker-compose.prod.yml` on the core application host
+and `deploy/livekit/` on a separate RTC host.
 
-- publishes the frontend on ports `80` and `443`
-- keeps `backend` and `db` internal to the Docker network
-- can start in plain HTTP mode first, then switch to HTTPS-only after a certificate is issued
-- uses a reduced PostgreSQL memory profile suitable for a small VPS
-
-If you want your own video infrastructure, deploy a separate LiveKit stack and set:
+Current production layout:
 
 ```text
-LIVEKIT_URL=wss://livekit.your-domain.com
-LIVEKIT_API_KEY=your-api-key
-LIVEKIT_API_SECRET=your-api-secret
+ghost-core  35.204.17.207  10.164.0.2  /opt/ghosttalk
+ghost-rtc   34.158.79.220  10.164.0.4  /opt/ghosttalk-livekit
 ```
 
-Detailed setup notes are in [docs/self-hosted-livekit.md](/home/d/source/ghost_talk/docs/self-hosted-livekit.md:1).
+Public names:
+
+```text
+ghost-talk.online       Cloudflare proxied HTTPS -> ghost-core
+meet.ghost-talk.online  LiveKit/RTC hostname -> ghost-rtc
+```
+
+The production compose file:
+
+- publishes only the frontend on host ports `80` and `443`;
+- keeps `backend`, PostgreSQL, Redis and workers internal to the Docker network;
+- does not start bundled LiveKit by default;
+- uses a reduced PostgreSQL memory profile suitable for a small VM.
+
+For the two-VM layout, run LiveKit from `deploy/livekit/` on `ghost-rtc`.
+The bundled LiveKit service is only for single-host deployments:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile bundled-livekit up -d --build
+```
+
+Detailed LiveKit notes are in [docs/self-hosted-livekit.md](/home/d/source/ghost_talk/docs/self-hosted-livekit.md:1).
+
+### Production secrets and env files
+
+Real env files are intentionally ignored by git:
+
+```text
+.env
+.env.prod
+deploy/livekit/.env
+```
+
+Only example files should be committed. Use
+[.env.prod.example](/home/d/source/ghost_talk/.env.prod.example:1) as the
+current production template and replace placeholder secrets before deploying.
+Never commit generated `LIVEKIT_API_SECRET`, `INTERNAL_WORKER_TOKEN`,
+Cloudflare API tokens, TLS keys or certbot credentials.
+
+### Server prerequisites
+
+- Ubuntu 24.04 or another Docker-capable Linux host
+- Docker Engine and Docker Compose plugin
+- SSH access to both VMs
+- Cloudflare DNS for `ghost-talk.online`
+- Cloudflare SSL/TLS mode set to `Full (strict)`
+- Cloudflare `Always Use HTTPS` enabled
+
+Install Docker on a fresh Ubuntu host:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in, or use `newgrp docker`, before running Docker as the SSH
+user.
+
+### DNS and firewall
+
+Cloudflare records:
+
+```text
+ghost-talk.online       A  35.204.17.207  Proxied
+meet.ghost-talk.online  A  34.158.79.220  DNS only
+```
+
+Core app traffic should not be open to the whole internet. In GCP firewall,
+allow `tcp:443` to `ghost-core` only from Cloudflare IP ranges. Fetch the
+current ranges before creating or updating the rule:
+
+```bash
+curl -fsS https://www.cloudflare.com/ips-v4
+curl -fsS https://www.cloudflare.com/ips-v6
+```
+
+Direct access to `35.204.17.207:443` should time out, while
+`https://ghost-talk.online/` should work through Cloudflare.
+
+For RTC media, configure the `ghost-rtc` firewall separately:
+
+```text
+tcp:80,443    ACME and HTTPS/WSS signaling through Caddy
+tcp:7881      LiveKit TCP fallback
+udp:50000-50100 LiveKit media
+```
+
+Keep `7880/tcp` private; Caddy proxies browser-facing WSS to LiveKit locally.
+
+### Core VM setup
+
+Upload the repository to `ghost-core`:
+
+```bash
+rsync -az --delete \
+  --exclude '.git' \
+  --exclude '.env' \
+  --exclude '.env.prod' \
+  --exclude 'frontend/node_modules' \
+  --exclude 'frontend/dist' \
+  ./ d_shkurchenko@35.204.17.207:/opt/ghosttalk/
+```
+
+Create `/opt/ghosttalk/.env` from `.env.prod.example`, replace placeholders
+with generated secrets, and keep the two-VM LiveKit upstream:
+
+```text
+HOST_FRONTEND_HTTP_PORT=80
+HOST_FRONTEND_HTTPS_PORT=443
+ENABLE_TLS=true
+SERVER_NAME=ghost-talk.online
+LIVEKIT_SERVER_NAME=meet.ghost-talk.online
+TLS_CERTS_DIR=/etc/letsencrypt
+TLS_CERT_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/fullchain.pem
+TLS_KEY_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/privkey.pem
+CERTBOT_WWW_PATH=./certbot-www
+LIVEKIT_URL=wss://meet.ghost-talk.online
+LIVEKIT_UPSTREAM=http://10.164.0.4:7880
+MEDIA_TOPOLOGY=dual
+LIVEKIT_API_KEY=ghosttalk-prod
+LIVEKIT_API_SECRET=<generated-secret>
+INTERNAL_WORKER_TOKEN=<generated-secret>
+CSP_CONNECT_SRC="'self' https://ghost-talk.online wss://meet.ghost-talk.online"
+CORS_ALLOWED_ORIGINS=https://ghost-talk.online
+```
+
+Generate secrets locally or on the VM:
+
+```bash
+openssl rand -hex 32
+```
+
+Start or update core services:
+
+```bash
+ssh d_shkurchenko@35.204.17.207
+cd /opt/ghosttalk
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+### HTTPS certificate with Cloudflare DNS-01
+
+The current production certificate is issued on `ghost-core` with Certbot's
+Cloudflare DNS plugin. This avoids opening `80/tcp` to the internet.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y certbot python3-certbot-dns-cloudflare
+sudo install -d -m 700 /root/.secrets/certbot
+sudo sh -c 'umask 077; printf "%s\n" "dns_cloudflare_api_token = <cloudflare-dns-api-token>" > /root/.secrets/certbot/cloudflare.ini'
+sudo certbot certonly \
+  --non-interactive \
+  --agree-tos \
+  --register-unsafely-without-email \
+  --dns-cloudflare \
+  --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+  --dns-cloudflare-propagation-seconds 60 \
+  --cert-name ghost-talk.online \
+  -d ghost-talk.online
+```
+
+Reload nginx after renewals:
+
+```bash
+sudo install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/ghosttalk-reload-nginx.sh >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
+cd /opt/ghosttalk
+/usr/bin/docker compose -f docker-compose.prod.yml exec -T frontend nginx -s reload || \
+  /usr/bin/docker compose -f docker-compose.prod.yml restart frontend
+EOF
+sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/ghosttalk-reload-nginx.sh
+```
+
+After issuing the certificate, recreate the frontend so nginx picks up HTTPS:
+
+```bash
+cd /opt/ghosttalk
+docker compose -f docker-compose.prod.yml up -d frontend
+```
+
+### RTC VM setup
+
+Upload the LiveKit stack:
+
+```bash
+rsync -az ./deploy/livekit/ d_shkurchenko@34.158.79.220:/opt/ghosttalk-livekit/
+```
+
+Create `/opt/ghosttalk-livekit/.env` from
+[deploy/livekit/.env.example](/home/d/source/ghost_talk/deploy/livekit/.env.example:1)
+and set `LIVEKIT_API_SECRET` to the same value as core.
+
+Start LiveKit:
+
+```bash
+ssh d_shkurchenko@34.158.79.220
+cd /opt/ghosttalk-livekit
+docker compose up -d
+```
+
+If DNS and the RTC firewall are ready, Caddy terminates public WSS on
+`meet.ghost-talk.online` and proxies to local LiveKit signaling.
+
+### Verify deployment
+
+From any machine:
+
+```bash
+curl -I http://ghost-talk.online/
+curl -I https://ghost-talk.online/
+curl https://ghost-talk.online/health
+```
+
+Expected result:
+
+- `http://ghost-talk.online/` returns `301` to HTTPS;
+- `https://ghost-talk.online/` returns `200` through Cloudflare;
+- `/health` returns `{"status":"ok"}`;
+- direct `35.204.17.207:443` access times out unless the source is Cloudflare.
+
+On `ghost-core`:
+
+```bash
+cd /opt/ghosttalk
+docker compose -f docker-compose.prod.yml ps
+certbot certificates --cert-name ghost-talk.online
+```
+
+On `ghost-rtc`:
+
+```bash
+cd /opt/ghosttalk-livekit
+docker compose ps
+```
+
+### Redeploy after changes
+
+```bash
+rsync -az --delete \
+  --exclude '.git' \
+  --exclude '.env' \
+  --exclude '.env.prod' \
+  --exclude 'frontend/node_modules' \
+  --exclude 'frontend/dist' \
+  ./ d_shkurchenko@35.204.17.207:/opt/ghosttalk/
+
+ssh d_shkurchenko@35.204.17.207
+cd /opt/ghosttalk
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+### Current deployment status
+
+The main application is live at:
+
+```text
+https://ghost-talk.online/
+```
+
+The current externally verified behavior is:
+
+```text
+https://ghost-talk.online/        -> HTTP/2 200
+http://ghost-talk.online/         -> 301 to HTTPS
+https://ghost-talk.online/health  -> {"status":"ok"}
+```
+
+Core origin HTTPS is protected behind Cloudflare; direct access to the core
+public IP should not be open to arbitrary clients.
+
+### Ready-made env template
+
+Use [.env.prod.example](/home/d/source/ghost_talk/.env.prod.example:1) as the
+final production template. It is prepared for:
+
+```text
+ghost-talk.online
+meet.ghost-talk.online
+```
 
 ## Dependency Scan
 
@@ -311,221 +596,12 @@ Container images:
 docker scout quickview
 ```
 
-### Server prerequisites
-
-- Ubuntu/Debian server with Docker Engine and Docker Compose plugin installed
-- SSH access to the server
-- A DNS name pointing to the server for browser-trusted HTTPS
-- Open inbound TCP ports `80` and `443`
-
-If Docker is not installed yet on Ubuntu, install it first:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2
-sudo systemctl enable --now docker
-sudo usermod -aG docker "$USER"
-newgrp docker
-```
-
-### One-time server setup
-
-```bash
-ssh root@YOUR_SERVER_IP
-mkdir -p /opt/ghost_talk
-cat > /opt/ghost_talk/.env <<'EOF'
-HOST_FRONTEND_HTTP_PORT=80
-HOST_FRONTEND_HTTPS_PORT=443
-ENABLE_TLS=false
-SERVER_NAME=ghost-talk.online
-TLS_CERTS_DIR=./certs
-CERTBOT_WWW_PATH=./certbot-www
-LIVEKIT_URL=
-LIVEKIT_API_KEY=
-LIVEKIT_API_SECRET=
-EOF
-```
-
-For a non-root user, use any writable app directory instead, for example:
-
-```bash
-mkdir -p ~/ghost_talk
-cat > ~/ghost_talk/.env <<'EOF'
-HOST_FRONTEND_HTTP_PORT=80
-HOST_FRONTEND_HTTPS_PORT=443
-ENABLE_TLS=false
-SERVER_NAME=ghost-talk.online
-TLS_CERTS_DIR=./certs
-CERTBOT_WWW_PATH=./certbot-www
-LIVEKIT_URL=
-LIVEKIT_API_KEY=
-LIVEKIT_API_SECRET=
-EOF
-```
-
-If `80` or `443` is already occupied on the target server, set other published ports instead, for example:
-
-```bash
-cat > /opt/ghost_talk/.env <<'EOF'
-HOST_FRONTEND_HTTP_PORT=13000
-HOST_FRONTEND_HTTPS_PORT=13443
-ENABLE_TLS=false
-SERVER_NAME=ghost-talk.online
-TLS_CERTS_DIR=./certs
-CERTBOT_WWW_PATH=./certbot-www
-LIVEKIT_URL=
-LIVEKIT_API_KEY=
-LIVEKIT_API_SECRET=
-EOF
-```
-
-### Upload current project state
-
-From the local machine:
-
-```bash
-rsync -az --delete \
-  --exclude '.git' \
-  --exclude '.env' \
-  --exclude 'frontend/node_modules' \
-  --exclude 'frontend/dist' \
-  ./ USER@YOUR_SERVER_IP:/path/to/ghost_talk/
-```
-
-### Start or update services
-
-```bash
-ssh root@YOUR_SERVER_IP
-cd /path/to/ghost_talk
-docker compose -f docker-compose.prod.yml up -d --build
-```
-
-At this point the app serves plain HTTP and exposes the ACME webroot at `/.well-known/acme-challenge/`.
-
-For the two-VM production layout, `docker-compose.prod.yml` does not start the bundled LiveKit container by default. Run the separate RTC stack from `deploy/livekit/` on the LiveKit host. The bundled LiveKit service is only for single-host deployments and requires:
-
-```bash
-docker compose -f docker-compose.prod.yml --profile bundled-livekit up -d --build
-```
-
-### Issue a TLS certificate
-
-Point your DNS name at the server first. For example:
-
-- `ghost-talk.online -> YOUR_SERVER_IP`
-
-Then issue a Let's Encrypt certificate while the stack is running:
-
-```bash
-cd /path/to/ghost_talk
-./deploy/reissue-letsencrypt.sh ghost-talk.online
-```
-
-If you prefer to do the `certbot` step manually, use the same webroot and domain:
-
-```bash
-sudo certbot certonly \
-  --webroot \
-  -w /path/to/ghost_talk/certbot-www \
-  --cert-name ghost-talk.online \
-  -d ghost-talk.online
-```
-
-After the certificate is issued, `.env` must point at the live certificate directory and keep TLS enabled:
-
-```bash
-cat > /path/to/ghost_talk/.env <<'EOF'
-HOST_FRONTEND_HTTP_PORT=80
-HOST_FRONTEND_HTTPS_PORT=443
-ENABLE_TLS=true
-SERVER_NAME=ghost-talk.online
-TLS_CERTS_DIR=/etc/letsencrypt
-TLS_CERT_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/fullchain.pem
-TLS_KEY_PATH_CONTAINER=/etc/nginx/tls/live/ghost-talk.online/privkey.pem
-CERTBOT_WWW_PATH=./certbot-www
-LIVEKIT_URL=wss://meet.ghost-talk.online
-LIVEKIT_UPSTREAM=http://10.164.0.4:7880
-LIVEKIT_API_KEY=devkey
-LIVEKIT_API_SECRET=replace-with-strong-secret
-EOF
-```
-
-Redeploy the frontend:
-
-```bash
-cd /path/to/ghost_talk
-docker compose -f docker-compose.prod.yml up -d --build frontend
-```
-
-The frontend container will then:
-
-- serve `https://ghost-talk.online/`
-- reject plain HTTP traffic on `80`
-- keep `/.well-known/acme-challenge/` reachable on port `80` for renewals
-
-### Verify deployment
-
-```bash
-docker compose -f docker-compose.prod.yml ps
-curl -I http://ghost-talk.online/
-curl -I https://ghost-talk.online/
-curl https://ghost-talk.online/health
-```
-
-Expected result:
-
-- `http://ghost-talk.online/` is rejected after TLS is enabled
-- `https://ghost-talk.online/` serves the frontend
-- `/health` returns `{"status":"ok"}`
-- API requests from the browser go through the frontend nginx proxy to the backend container
-
-### Redeploy after changes
-
-```bash
-rsync -az --delete \
-  --exclude '.git' \
-  --exclude '.env' \
-  --exclude 'frontend/node_modules' \
-  --exclude 'frontend/dist' \
-  ./ USER@YOUR_SERVER_IP:/path/to/ghost_talk/
-
-ssh USER@YOUR_SERVER_IP
-cd /path/to/ghost_talk
-docker compose -f docker-compose.prod.yml up -d --build
-```
-
-### Current deployment
-
-Current live deployment was performed on:
-
-```text
-ghost@10.110.12.212
-```
-
-Project directory:
-
-```text
-/home/ghost/ghost_talk
-```
-
-Published URL:
-
-```text
-https://ghost-talk.online/
-```
-
-Public DNS for this deployment should point `ghost-talk.online` at the `ghost-core` public IP, after which a normal Let's Encrypt certificate can be issued.
-
-### Ready-made env template
-
-Use [.env.prod.example](/home/d/source/ghost_talk/.env.prod.example:1) as the final post-certificate template. It is already prepared for `ghost-talk.online`.
-
 ## Internal CA for LAN
 
 If you do not have a public domain and the app stays inside LAN, use an internal CA instead of Let's Encrypt.
 
 - Recommended internal name: `ghosttalk.home.arpa`
-- Current LAN host IP: `10.110.12.212`
+- Example LAN host IP used in the docs: `10.110.12.212`
 - LAN env template: [.env.lan.example](/home/d/source/ghost_talk/.env.lan.example:1)
 - LAN compose file: [docker-compose.lan.yml](/home/d/source/ghost_talk/docker-compose.lan.yml:1)
 - Full guide: [docs/internal-ca-lan.md](/home/d/source/ghost_talk/docs/internal-ca-lan.md:1)
@@ -561,9 +637,10 @@ The LAN compose file publishes only `443`, so plain HTTP is not exposed on the h
 - `GET /api/sessions/:code/summary`
 - `GET /api/sessions/:code/events` (SSE)
 
-## Privacy Notes (PoC)
+## Privacy Notes
 
 - Participant identity is anonymous to other participants.
 - No participant names are displayed.
-- No raw voice files are stored (mock text transcription only).
+- Raw voice files are not stored by default.
+- Live speech transcription runs through the worker/STT pipeline after participant consent.
 - Basic input validation is enforced server-side.
